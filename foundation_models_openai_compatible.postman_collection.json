@@ -1,0 +1,89 @@
+{
+	"info": {
+		"_postman_id": "d4f66b6a-c9e4-49d6-8d08-cb48b38ee9db",
+		"name": "Foundation Models - OpenAI Compatible",
+		"description": "Коллекция в формате OpenAI API для провайдера Foundation Models. Используйте переменные collection-level: baseUrl и apiKey.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.0.0/collection.json",
+		"_exporter_id": "7379456"
+	},
+	"item": [
+		{
+			"name": "Models - List",
+			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"url": "{{baseUrl}}/v1/models"
+			},
+			"response": []
+		},
+		{
+			"name": "Chat Completions - Create",
+			"request": {
+				"auth": {
+					"type": "bearer",
+					"bearer": {
+						"token": "{{apiKey}}"
+					}
+				},
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"model\": \"openai/gpt-oss-120b\",\n  \"messages\": [\n    { \"role\": \"system\", \"content\": \"You are a helpful assistant.\" },\n    { \"role\": \"user\", \"content\": \"Hello!\" }\n  ],\n  \"temperature\": 0.7,\n  \"max_tokens\": 100\n}"
+				},
+				"url": "{{baseUrl}}/v1/chat/completions"
+			},
+			"response": []
+		}
+	],
+	"auth": {
+		"type": "bearer",
+		"bearer": {
+			"token": "{{apiKey}}"
+		}
+	},
+	"event": [
+		{
+			"listen": "prerequest",
+			"script": {
+				"type": "text/javascript",
+				"packages": {},
+				"exec": [
+					""
+				]
+			}
+		},
+		{
+			"listen": "test",
+			"script": {
+				"type": "text/javascript",
+				"packages": {},
+				"exec": [
+					""
+				]
+			}
+		}
+	],
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "https://foundation-models.api.cloud.ru",
+			"type": "string"
+		},
+		{
+			"key": "apiKey",
+			"value": "",
+			"type": "string"
+		}
+	]
+}

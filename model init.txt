@@ -1,0 +1,19 @@
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="ваш_api_ключ",
+    base_url="https://foundation-models.api.cloud.ru/v1"
+)
+
+response = client.chat.completions.create(
+    model="ai-sage/GigaChat3-10B-A1.8B",
+    messages=[{"role": "user", "content": "Привет!"}]
+)
+print(response.choices[0].message.content)
+
+deepseek-ai/DeepSeek-V4-Flash    эту модель возьмем 
+#https://cloud.ru/docs/console_api/ug/topics/guides__service_accounts_key-create?source-platform=Evolution
+#https://cloud.ru/docs/foundation-models/ug/topics/overview__available__models
+#https://cloud.ru/docs/foundation-models/ug/topics/api-ref?source-platform=Evolution
+#https://cloud.ru/docs/console_api/ug/topics/overview__reestr_api
+

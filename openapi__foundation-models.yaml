@@ -1,0 +1,444 @@
+openapi: 3.0.1
+info:
+  title: Cloud.ru Foundation Models API (OpenAI-compatible)
+  version: "1.0.0"
+  description: |
+    Совместимая со схемой OpenAI OpenAPI-спецификация для Foundation Models, ограниченная двумя методами:
+    - GET /v1/models
+    - POST /v1/chat/completions
+
+    [Документациия Foundation Models](https://cloud.ru/docs/foundation-models/ug/index.html).
+
+servers:
+  - url: https://foundation-models.api.cloud.ru
+
+tags:
+  - name: Models
+    description: Управление и просмотр доступных моделей.
+  - name: Chat Completions
+    description: Генерация ответов в стиле чата.
+
+paths:
+  /v1/models:
+    get:
+      tags: [Models]
+      operationId: listModels
+      summary: Получить список доступных моделей
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Успешный ответ с перечнем моделей
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelList'
+
+  /v1/chat/completions:
+    post:
+      tags: [Chat Completions]
+      operationId: createChatCompletion
+      summary: Создать завершение чата
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateChatCompletionRequest'
+      responses:
+        '200':
+          description: Успешный ответ с завершением чата
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateChatCompletionResponse'
+        '400':
+          description: Неверный запрос
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Ресурс не найден
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Ошибка валидации
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationErrorResponse'
+        '500':
+          description: Внутренняя ошибка сервера
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    Model:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Уникальный идентификатор модели
+        object:
+          type: string
+          example: model
+        created:
+          type: integer
+          format: int64
+          description: Временная метка создания модели
+        owned_by:
+          type: string
+          description: Владелец модели
+        max_model_len:
+          type: integer
+          description: Максимальная длина контекста модели в токенах
+        metadata:
+          $ref: '#/components/schemas/ModelMetadata'
+
+    ModelMetadata:
+      type: object
+      description: Дополнительные метаданные модели
+      additionalProperties: true
+      properties:
+        company:
+          type: string
+        generated_tokens_cost:
+          type: number
+        license:
+          type: string
+        name:
+          type: string
+        prompt_tokens_cost:
+          type: number
+        readme:
+          type: string
+        type:
+          type: string
+
+    ModelList:
+      type: object
+      properties:
+        object:
+          type: string
+          example: list
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Model'
+
+    ChatCompletionMessage:
+      type: object
+      description: Сообщение чата. Поддерживает роли system, user, assistant, developer, tool, function и расширенные поля OpenAI.
+      required:
+        - role
+      properties:
+        role:
+          type: string
+          description: Роль автора сообщения
+        content:
+          type: string
+        name:
+          type: string
+        refusal:
+          type: string
+        audio:
+          type: object
+          properties:
+            id:
+              type: string
+        function_call:
+          $ref: '#/components/schemas/FunctionCall'
+        tool_calls:
+          type: array
+          items:
+            $ref: '#/components/schemas/ToolCall'
+        tool_call_id:
+          type: string
+
+    CreateChatCompletionRequest:
+      type: object
+      description: Схема запроса на создание завершения чата (совместима с OpenAI и расширена по вашему описанию).
+      required: [model, messages]
+      additionalProperties: true
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatCompletionMessage'
+        model:
+          type: string
+        frequency_penalty:
+          type: number
+        logit_bias:
+          type: object
+          additionalProperties:
+            type: number
+        logprobs:
+          type: boolean
+        top_logprobs:
+          type: integer
+        max_completion_tokens:
+          type: integer
+        n:
+          type: integer
+          default: 1
+        presence_penalty:
+          type: number
+        response_format:
+          type: object
+          additionalProperties: {}
+          properties:
+            type:
+              type: string
+              enum: [text, json_object]
+            json_schema:
+              type: object
+              additionalProperties: {}
+              properties:
+                name:
+                  type: string
+                description:
+                  type: string
+                schema:
+                  type: object
+                  additionalProperties: {}
+                strict:
+                  type: boolean
+        seed:
+          type: integer
+          format: int64
+        stop:
+          type: array
+          items:
+            type: string
+        stream:
+          type: boolean
+        stream_options:
+          type: object
+          additionalProperties: {}
+          properties:
+            include_usage:
+              type: boolean
+            continuous_usage_stats:
+              type: boolean
+        temperature:
+          type: number
+        top_p:
+          type: number
+        tools:
+          type: array
+          items:
+            $ref: '#/components/schemas/ToolDefinition'
+        tool_choice:
+          oneOf:
+            - type: string
+            - type: object
+        parallel_tool_calls:
+          type: boolean
+        user:
+          type: string
+        best_of:
+          type: integer
+        use_beam_search:
+          type: boolean
+        top_k:
+          type: integer
+        min_p:
+          type: number
+        repetition_penalty:
+          type: number
+        length_penalty:
+          type: number
+        stop_token_ids:
+          type: array
+          items:
+            type: integer
+        include_stop_str_in_output:
+          type: boolean
+        ignore_eos:
+          type: boolean
+        min_tokens:
+          type: integer
+        skip_special_tokens:
+          type: boolean
+        spaces_between_special_tokens:
+          type: boolean
+        truncate_prompt_tokens:
+          type: integer
+        allowed_token_ids:
+          type: array
+          items:
+            type: integer
+        bad_words:
+          type: array
+          items:
+            type: string
+        echo:
+          type: boolean
+        add_generation_prompt:
+          type: boolean
+        continue_final_message:
+          type: boolean
+        add_special_tokens:
+          type: boolean
+        chat_template:
+          type: string
+        chat_template_kwargs:
+          type: object
+          additionalProperties: {}
+        mm_processor_kwargs:
+          type: object
+          additionalProperties: {}
+        guided_json:
+          type: string
+        guided_regex:
+          type: string
+        guided_choice:
+          type: array
+          items:
+            type: string
+        guided_grammar:
+          type: string
+        structural_tag:
+          type: string
+        guided_decoding_backend:
+          type: string
+        guided_whitespace_pattern:
+          type: string
+        priority:
+          type: integer
+ 
+
+    ChatCompletionChoice:
+      type: object
+      properties:
+        index:
+          type: integer
+        message:
+          $ref: '#/components/schemas/ChatCompletionMessage'
+        finish_reason:
+          type: string
+
+    Usage:
+      type: object
+      properties:
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+        total_tokens:
+          type: integer
+
+    CreateChatCompletionResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          example: chatcmpl-123
+        object:
+          type: string
+          example: chat.completion
+        created:
+          type: integer
+          format: int64
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatCompletionChoice'
+        usage:
+          $ref: '#/components/schemas/Usage'
+
+    FunctionCall:
+      type: object
+      properties:
+        arguments:
+          type: string
+        name:
+          type: string
+
+    ToolFunction:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        parameters:
+          type: object
+          additionalProperties: {}
+
+    ToolCall:
+      type: object
+      properties:
+        id:
+          type: string
+        function:
+          $ref: '#/components/schemas/FunctionCall'
+        type:
+          type: string
+          enum: [function]
+
+    ToolDefinition:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [function]
+        function:
+          $ref: '#/components/schemas/ToolFunction'
+
+    ErrorResponse:
+      type: object
+      properties:
+        object:
+          type: string
+          example: error
+        message:
+          type: string
+        type:
+          type: string
+        param:
+          type: string
+        code:
+          type: integer
+        additionalProp1:
+          nullable: true
+
+    ValidationErrorItem:
+      type: object
+      properties:
+        loc:
+          type: array
+          items:
+            oneOf:
+              - type: string
+              - type: integer
+        msg:
+          type: string
+        type:
+          type: string
+
+    ValidationErrorResponse:
+      type: object
+      properties:
+        detail:
+          type: array
+          items:
+            $ref: '#/components/schemas/ValidationErrorItem'
+
