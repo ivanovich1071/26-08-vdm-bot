@@ -1,0 +1,53 @@
+[project]
+name = "vdm-bot"
+version = "0.1.0"
+description = "Диалоговый бот-магазин для vdm.ru: Telegram, виджет на сайт, MAX"
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram>=3.13",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+    "redis>=5.0",
+    "httpx>=0.27",
+    "openai>=1.40",
+    "pydantic>=2.8",
+    "pydantic-settings>=2.4",
+    "gspread>=6.1",
+    "google-auth>=2.34",
+    "apscheduler>=3.10",
+    "tenacity>=9.0",
+    # Реестр «пункт приказа 1057 → код 1С» заказчик присылает в PDF.
+    "pypdf>=5.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.6"]
+
+[project.scripts]
+vdm-ingest = "ingest.build_kb:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]

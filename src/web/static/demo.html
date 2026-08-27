@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Демо виджета · ЭЛТИ-КУДИЦ</title>
+  <style>
+    body { margin: 0; font: 16px/1.6 -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+           color: #1c2430; background: #fff; }
+    header { background: #0b6ab0; color: #fff; padding: 20px 32px; }
+    header b { font-size: 20px; }
+    main { max-width: 780px; margin: 0 auto; padding: 40px 24px 120px; }
+    h1 { font-size: 28px; margin: 0 0 8px; }
+    .lead { color: #5a6a7d; margin-bottom: 32px; }
+    .card { border: 1px solid #e3e8ee; border-radius: 12px; padding: 20px 24px; margin-bottom: 16px; }
+    .card h2 { font-size: 17px; margin: 0 0 10px; }
+    code { background: #f2f5f8; padding: 2px 6px; border-radius: 4px; font-size: 14px; }
+    pre { background: #f2f5f8; padding: 14px 16px; border-radius: 8px; overflow-x: auto; }
+    ul { margin: 8px 0 0; padding-left: 20px; }
+    .hint { color: #7d8b9c; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <header><b>ЭЛТИ-КУДИЦ</b> · демонстрационная страница</header>
+  <main>
+    <h1>Виджет-консультант</h1>
+    <p class="lead">
+      Страница нужна, чтобы показать виджет до того, как появится доступ к шаблону
+      сайта. Сам виджет — в правом нижнем углу.
+    </p>
+
+    <div class="card">
+      <h2>Что попробовать</h2>
+      <ul>
+        <li>«мячи для спортивного зала в наличии до 2000 руб»</li>
+        <li>«2.20.63» — поиск по номеру пункта приказа</li>
+        <li>«что нужно в кабинет логопеда по приказу 838»</li>
+        <li>собрать заказ и нажать «Оформить»</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h2>Как встроить на vdm.ru</h2>
+      <p>Один тег перед закрывающим <code>&lt;/body&gt;</code> в шаблоне Битрикса:</p>
+      <pre>&lt;script src="__BASE_URL__/widget.js" defer&gt;&lt;/script&gt;</pre>
+      <p class="hint">
+        Домен сайта должен быть в списке разрешённых источников
+        (<code>WIDGET_ALLOWED_ORIGINS</code>) — иначе браузер заблокирует запросы.
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>Что виджет делает и чего не делает</h2>
+      <ul>
+        <li>консультирует по каталогу и ведёт к заказу;</li>
+        <li>называет нормативное основание, когда оно есть в данных;</li>
+        <li>собирает заказ и передаёт менеджеру;</li>
+        <li>карточек товара с фото здесь нет — это чат с заявкой, а не витрина;</li>
+        <li>оплату не принимает.</li>
+      </ul>
+    </div>
+  </main>
+
+  <script src="__BASE_URL__/widget.js" data-base="__BASE_URL__" defer></script>
+</body>
+</html>

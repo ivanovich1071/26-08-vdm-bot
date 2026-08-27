@@ -1,0 +1,44 @@
+# Развёртывание прототипа на виртуальной машине Cloud.ru.
+#
+# Виджет и Telegram-бот подняты отдельными сервисами: у них разный режим работы
+# (HTTP против long polling), и падение одного не должно ронять другой.
+#
+#   docker compose up -d --build
+#   docker compose run --rm ingest   # пересобрать базу знаний после новой выгрузки
+
+services:
+  widget:
+    build: .
+    command: python run.py widget
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./secrets:/app/secrets:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  telegram:
+    build: .
+    command: python run.py telegram
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./secrets:/app/secrets:ro
+    restart: unless-stopped
+    depends_on:
+      - widget
+
+  # Разовая задача: запускается вручную, когда заказчик прислал новую выгрузку 1С.
+  ingest:
+    build: .
+    command: python run.py ingest --source data/raw/pricelist.xlsx
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    profiles: ["tools"]

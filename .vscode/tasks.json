@@ -1,0 +1,42 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Тесты",
+      "type": "shell",
+      "command": "python -m pytest tests -q",
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Линтер",
+      "type": "shell",
+      "command": "python -m ruff check src tests run.py",
+      "problemMatcher": []
+    },
+    {
+      "label": "Пересобрать базу знаний",
+      "type": "shell",
+      "command": "python run.py ingest --source data/raw/Pricelist20260826.xlsx",
+      "problemMatcher": []
+    },
+    {
+      "label": "Собрать фотографии товаров",
+      "type": "shell",
+      "command": "python run.py media",
+      "problemMatcher": []
+    },
+    {
+      "label": "Фотографии: перелить в базу знаний",
+      "type": "shell",
+      "command": "python run.py media --sync",
+      "problemMatcher": []
+    },
+    {
+      "label": "Показать диалоги",
+      "type": "shell",
+      "command": "python run.py dialogs --last 20",
+      "problemMatcher": []
+    }
+  ]
+}

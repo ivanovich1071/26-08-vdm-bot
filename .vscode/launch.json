@@ -1,0 +1,64 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Виджет (сайт + демо)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run.py",
+      "args": ["widget"],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Telegram-бот",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run.py",
+      "args": ["telegram"],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Сборка базы знаний",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run.py",
+      "args": ["ingest", "--source", "data/raw/Pricelist20260826.xlsx"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Фотографии: весь каталог",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run.py",
+      "args": ["media"],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Фотографии: пробный прогон (20 карточек)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run.py",
+      "args": ["media", "--cards", "20"],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Поиск из консоли",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run.py",
+      "args": ["search", "мячи для спортивного зала в наличии до 2000 руб"],
+      "console": "integratedTerminal"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Всё сразу: виджет + Telegram",
+      "configurations": ["Виджет (сайт + демо)", "Telegram-бот"],
+      "stopAll": true
+    }
+  ]
+}
