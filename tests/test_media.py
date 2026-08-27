@@ -373,3 +373,38 @@ def test_listing_preview_is_upgraded_to_the_full_size_photo(storage):
 
     service.images_for(product())
     assert fetcher.calls == 1, "после замены на сайт больше не ходим"
+
+
+def test_network_errors_are_told_apart_from_missing_photos(storage):
+    """Пустой список бывает по двум причинам, и различать их обязательно."""
+    service = MediaService(storage, StubFetcher(error=FetchError("таймаут")), enabled=True)
+
+    service.images_for(product("S1"))
+    service.images_for(product("S2"))
+    assert service.consecutive_errors == 2, "сайт не отвечает"
+
+    page = b'<meta property="og:image" content="https://vdm.ru/a/1200_1200_h/1.jpg" />'
+    service.fetcher = StubFetcher(FetchResult(body=page, status=200))
+    service.images_for(product("S3"))
+    assert service.consecutive_errors == 0, "страница загрузилась — счётчик сброшен"
+
+
+def test_page_without_photos_does_not_look_like_an_outage(storage):
+    page = "<html>нет картинок</html>".encode()
+    service = MediaService(storage, StubFetcher(FetchResult(body=page, status=200)), enabled=True)
+
+    assert service.images_for(product()) == []
+    assert service.consecutive_errors == 0
+
+
+def test_walk_stops_when_the_site_goes_down(storage, capsys):
+    """Регрессия: обход молча перебирал тысячи позиций по минуте на каждую."""
+    import run
+
+    service = MediaService(storage, StubFetcher(error=FetchError("таймаут")), enabled=True)
+    queue = [product(f"S{n}") for n in range(50)]
+
+    run._walk_cards(service, queue)
+
+    assert service.fetches == 3, "после трёх отказов подряд обход прекращается"
+    assert "Сайт не отвечает" in capsys.readouterr().out

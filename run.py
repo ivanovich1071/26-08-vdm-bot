@@ -141,8 +141,6 @@ def _collect_media(args) -> None:  # noqa: ANN001 — argparse.Namespace
     что успели собрать, то и попадает в `products.jsonl`. Повторный запуск
     продолжает с места остановки, потому что уже собранное лежит в кэше.
     """
-    import time
-
     from core.app import build_engine
     from core.config import Settings
     from media.sync import sync_to_kb
@@ -165,28 +163,88 @@ def _collect_media(args) -> None:  # noqa: ANN001 — argparse.Namespace
     limit = len(products) if args.cards == "all" else int(args.cards)
     queue = products[:limit]
     if queue:
-        started = time.monotonic()
-        done = failed = 0
-        try:
-            for number, product in enumerate(queue, 1):
-                if engine.media.images_for(product):
-                    done += 1
-                else:
-                    failed += 1
-                if number % 50 == 0 or number == len(queue):
-                    elapsed = time.monotonic() - started
-                    left = (len(queue) - number) * elapsed / number
-                    print(
-                        f"  {number}/{len(queue)} · с фото {done} · без {failed} · "
-                        f"осталось ~{left / 60:.0f} мин",
-                        flush=True,
-                    )
-        except KeyboardInterrupt:
-            print("\nОстановлено. Собранное сохраняем.")
-        print(f"карточек обработано: {done + failed}, с фото: {done}, без: {failed}")
+        _walk_cards(engine.media, queue)
 
     print("в кэше:", engine.storage.media_stats())
     print("перелито в базу знаний:", sync_to_kb(engine.storage, settings.kb_path))
+
+
+def _walk_cards(media, queue: list) -> None:  # noqa: ANN001 — media/service.py
+    """Обход карточек с честным прогрессом.
+
+    Скорость плавает на три порядка: то, что уже в кэше, идёт мгновенно, а одна
+    недоступная страница стоит минуту. Поэтому прогресс печатается по времени,
+    а не по числу товаров — иначе после быстрого куска наступает тишина на час,
+    и обход выглядит зависшим.
+    """
+    import time
+
+    from core.ui import plural
+    from media.service import MediaService
+
+    # Сайт может быть недоступен целиком. Молча перебирать оставшиеся тысячи
+    # позиций по минуте на каждую — сутки впустую, поэтому останавливаемся.
+    give_up_after = 3
+    report_every = 15.0  # секунд
+
+    started = last_report = time.monotonic()
+    done = failed = 0
+    stopped = ""
+    announced = False
+
+    try:
+        for number, product in enumerate(queue, 1):
+            if media.images_for(product):
+                done += 1
+            else:
+                failed += 1
+
+            if isinstance(media, MediaService) and media.consecutive_errors >= give_up_after:
+                pages = plural(give_up_after, "страница", "страницы", "страниц")
+                stopped = (
+                    f"\nСайт не отвечает: {give_up_after} {pages} подряд не загрузились.\n"
+                    "Обход остановлен, собранное сохранено. Продолжить можно той же\n"
+                    "командой оттуда, где vdm.ru открывается."
+                )
+                break
+
+            now = time.monotonic()
+            fetches = getattr(media, "fetches", 0)
+            if fetches and not announced:
+                # Первое обращение к сайту стоит отметить сразу: до него обход
+                # летит по кэшу, и без этой строки переход на медленный режим
+                # выглядит как зависание.
+                announced = True
+                print(
+                    f"  {number - 1} карточек взято из кэша, дальше загрузка с сайта",
+                    flush=True,
+                )
+            if now - last_report >= report_every or number == len(queue):
+                last_report = now
+                line = f"  {number}/{len(queue)} · с фото {done} · без {failed}"
+                # Оценку строим по реальным загрузкам: чтение кэша к оставшейся
+                # работе отношения не имеет.
+                if fetches:
+                    per_fetch = (now - started) / fetches
+                    left = (len(queue) - number) * per_fetch
+                    line += f" · загружено {fetches} · осталось ~{_duration(left)}"
+                else:
+                    line += " · всё из кэша"
+                print(line, flush=True)
+    except KeyboardInterrupt:
+        stopped = "\nОстановлено. Собранное сохраняем."
+
+    if stopped:
+        print(stopped)
+    print(f"карточек обработано: {done + failed}, с фото: {done}, без: {failed}")
+
+
+def _duration(seconds: float) -> str:
+    if seconds < 90:
+        return f"{seconds:.0f} с"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f} мин"
+    return f"{seconds / 3600:.1f} ч"
 
 
 def _format_dialogs(sessions: dict, channel: str | None) -> list[str]:

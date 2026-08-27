@@ -37,6 +37,12 @@ class MediaService:
     fetcher: PageFetcher
     enabled: bool = True
 
+    # Сколько загрузок подряд закончились ошибкой сети. Отличает «у этого товара
+    # нет фото» от «сайт не отвечает»: снаружи и то и другое выглядит как пустой
+    # список, а решения требует разного.
+    consecutive_errors: int = 0
+    fetches: int = 0
+
     def images_for(self, product: Product) -> list[str]:
         """Адреса фотографий товара. Пустой список — фото нет, и это нормально."""
         if not self.enabled:
@@ -94,9 +100,11 @@ class MediaService:
         last_modified = cached["last_modified"] if cached else None
         failures = cached["failures"] if cached else 0
 
+        self.fetches += 1
         try:
             result = self.fetcher.get(product.url, etag=etag, last_modified=last_modified)
         except FetchError as exc:
+            self.consecutive_errors += 1
             log.info("Фото для %s не получено: %s", product.sku_1c, exc)
             self.storage.save_media(
                 product.sku_1c,
@@ -108,6 +116,7 @@ class MediaService:
             )
             return cached["images"] if cached else []
 
+        self.consecutive_errors = 0
         if result.not_modified and cached is not None:
             return cached["images"]
         if result.body is None:
