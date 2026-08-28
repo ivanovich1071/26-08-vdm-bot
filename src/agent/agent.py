@@ -1,8 +1,8 @@
 """Агент: консультант и продажник в одном диалоге.
 
-Ключевое свойство — деградация без обрыва. Если ключа Cloud.ru нет, модель не ответила
-или исчерпала попытки, диалог продолжается обычным поиском по каталогу. Бот, который
-молчит из-за недоступности внешнего сервиса, хуже бота без модели.
+Ключевое свойство — деградация без обрыва. Если провайдер не ответил, пробуем
+следующего; если легли все — диалог продолжается обычным поиском по каталогу.
+Бот, который молчит из-за недоступности внешнего сервиса, хуже бота без модели.
 
 Персональные данные до модели не доходят: текст маскируется перед отправкой и
 восстанавливается в ответе.
@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from pathlib import Path
 
 from agent.client import ChatClient, LLMError
+from agent.providers import LLMRouter
 from agent.tools import TOOL_SCHEMAS, ToolBox
 from core.ui import Button, Keyboard, Message, ProductCard, Response
 from privacy.masking import Masker
@@ -26,11 +26,9 @@ PROMPTS_DIR = Path(__file__).parent / "prompts"
 MAX_TOOL_ROUNDS = 4
 HISTORY_LIMIT = 12
 
-# Если модель недоступна, откат на поиск происходит после таймаута. Без паузы
-# каждое следующее сообщение снова ждало бы полный таймаут, и бот выглядел бы
-# зависшим у всех пользователей сразу. Поэтому после сбоя не трогаем модель
-# несколько минут и отвечаем поиском мгновенно.
-COOLDOWN_SECONDS = 300
+# Порядок склейки промптов: сначала маршрутизация веток, потом роли, в конце —
+# границы. Так правила защиты не тонут в середине длинного текста.
+PROMPT_PARTS = ("router", "consultant", "salesman", "guard")
 
 
 def load_prompt(name: str) -> str:
@@ -39,20 +37,16 @@ def load_prompt(name: str) -> str:
 
 
 class SalesAgent:
-    def __init__(self, engine, client: ChatClient) -> None:  # noqa: ANN001
+    def __init__(self, engine, router: LLMRouter) -> None:  # noqa: ANN001
         self.engine = engine
-        self.client = client
+        self.router = router
         self.system_prompt = "\n\n".join(
-            part for part in (load_prompt("consultant"), load_prompt("salesman")) if part
+            part for part in (load_prompt(name) for name in PROMPT_PARTS) if part
         )
-        self._unavailable_until = 0.0
 
     @property
     def available(self) -> bool:
-        return time.monotonic() >= self._unavailable_until
-
-    def _mark_unavailable(self) -> None:
-        self._unavailable_until = time.monotonic() + COOLDOWN_SECONDS
+        return self.router.available
 
     def reply(self, session, text: str) -> list[Response]:  # noqa: ANN001
         if not self.available:
@@ -67,14 +61,10 @@ class SalesAgent:
         ]
 
         try:
-            answer = self._run(messages, tools)
-        except LLMError as exc:
-            self._mark_unavailable()
-            log.warning(
-                "Модель недоступна, отвечаем поиском и не обращаемся к ней %s с: %s",
-                COOLDOWN_SECONDS,
-                exc,
-            )
+            answer = self._ask(messages, tools)
+        except LLMError:
+            # Провайдеры уже помечены нерабочими и записаны в лог — здесь остаётся
+            # только доиграть ход поиском по каталогу.
             return self.engine.search(session, text)
 
         answer = masker.unmask(answer)
@@ -83,20 +73,37 @@ class SalesAgent:
 
     # --- Цикл вызова инструментов -------------------------------------------
 
-    def _run(self, messages: list[dict], tools: ToolBox) -> str:
+    def _ask(self, messages: list[dict], tools: ToolBox) -> str:
+        """Ход разговора: пробуем провайдеров по очереди, пока кто-то не ответит.
+
+        Каждому даём свою копию сообщений. Цикл вызова инструментов дописывает
+        в них ответы модели, и остатки неудачной попытки не должны утекать
+        следующему провайдеру: служебные поля у них разные.
+        """
+        last: LLMError | None = None
+        for client in self.router.ready():
+            try:
+                answer = self._run(client, list(messages), tools)
+            except LLMError as exc:
+                self.router.mark_down(client, exc)
+                last = exc
+                continue
+            self.router.mark_up(client)
+            return answer
+        raise last or LLMError("нет настроенных провайдеров модели")
+
+    def _run(self, client: ChatClient, messages: list[dict], tools: ToolBox) -> str:
         for _ in range(MAX_TOOL_ROUNDS):
-            message = self.client.complete(messages, tools=TOOL_SCHEMAS)
+            message = client.complete(messages, tools=TOOL_SCHEMAS)
             calls = message.get("tool_calls") or []
             if not calls:
                 return (message.get("content") or "").strip()
 
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": message.get("content") or "",
-                    "tool_calls": calls,
-                }
-            )
+            # Ответ модели возвращаем в историю как есть. Пересобирать его из
+            # content и tool_calls нельзя: рассуждающие модели отдают ещё и
+            # reasoning_content, а Cloud.ru требует это поле обратно — без него
+            # следующий запрос падает с «Missing reasoning_content field».
+            messages.append(_assistant_message(message))
             for call in calls:
                 function = call.get("function", {})
                 arguments = _parse_arguments(function.get("arguments"))
@@ -112,7 +119,7 @@ class SalesAgent:
                 "content": "Ответь пользователю по уже собранным данным, без новых вызовов.",
             }
         )
-        return (self.client.complete(messages).get("content") or "").strip()
+        return (client.complete(messages).get("content") or "").strip()
 
     # --- Сборка ответа --------------------------------------------------------
 
@@ -158,10 +165,28 @@ class SalesAgent:
         return keyboard
 
     def _history(self, session, masker: Masker) -> list[dict]:  # noqa: ANN001
-        return [
-            {"role": item["role"], "content": masker.mask(item["content"])}
-            for item in session.history[-HISTORY_LIMIT:-1]
-        ]
+        history = []
+        for item in session.history[-HISTORY_LIMIT:-1]:
+            message = {"role": item["role"], "content": masker.mask(item["content"])}
+            if item["role"] == "assistant":
+                # Само рассуждение не храним, но поле должно присутствовать:
+                # валидатор Cloud.ru требует его у каждого ответа ассистента.
+                message["reasoning_content"] = ""
+            history.append(message)
+        return history
+
+
+def _assistant_message(message: dict) -> dict:
+    """Ответ модели в том виде, в каком его примут обратно.
+
+    Провайдеры расходятся в служебных полях, поэтому ничего не выбрасываем и
+    ничего не придумываем: берём пришедшее и добавляем только то, чего нет.
+    """
+    kept = {key: value for key, value in message.items() if value is not None}
+    kept.setdefault("role", "assistant")
+    kept.setdefault("content", "")
+    kept.setdefault("reasoning_content", "")
+    return kept
 
 
 def _parse_arguments(raw: str | dict | None) -> dict:

@@ -31,10 +31,16 @@ class Settings:
     kb_path: str = "data/kb/products.jsonl"
     storage_path: str = "data/vdm.sqlite3"
 
-    # Cloud.ru Foundation Models
+    # Модель. Провайдеров два: Cloud.ru — то, где всё будет работать у заказчика,
+    # OpenRouter — то, где диалог можно проверить с машины разработки, когда
+    # российское облако с неё не открывается. «auto» пробует их в этом порядке.
+    llm_provider: str = "auto"  # auto | cloudru | openrouter
     cloudru_api_key: str = ""
     cloudru_base_url: str = "https://foundation-models.api.cloud.ru/v1"
     cloudru_model: str = "deepseek-ai/DeepSeek-V4-Flash"
+    openrouter_api_key: str = ""
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_model: str = "qwen/qwen3-235b-a22b-2507"
     llm_timeout_seconds: float = 60.0
     llm_max_tokens: int = 1200
 
@@ -79,9 +85,13 @@ class Settings:
         return cls(
             kb_path=env.get("KB_PATH", cls.kb_path),
             storage_path=env.get("STORAGE_PATH", cls.storage_path),
+            llm_provider=env.get("LLM_PROVIDER", cls.llm_provider).strip().lower(),
             cloudru_api_key=env.get("CLOUDRU_API_KEY", ""),
             cloudru_base_url=env.get("CLOUDRU_BASE_URL", cls.cloudru_base_url),
             cloudru_model=env.get("CLOUDRU_MODEL", cls.cloudru_model),
+            openrouter_api_key=env.get("OPENROUTER_API_KEY", ""),
+            openrouter_base_url=env.get("OPENROUTER_BASE_URL", cls.openrouter_base_url),
+            openrouter_model=env.get("OPENROUTER_MODEL", cls.openrouter_model),
             llm_timeout_seconds=float(env.get("LLM_TIMEOUT_SECONDS", cls.llm_timeout_seconds)),
             llm_max_tokens=int(env.get("LLM_MAX_TOKENS", cls.llm_max_tokens)),
             telegram_token=env.get("TELEGRAM_TOKEN", ""),
@@ -109,4 +119,8 @@ class Settings:
 
     @property
     def llm_enabled(self) -> bool:
-        return bool(self.cloudru_api_key)
+        """Настроен ли хоть один провайдер, разрешённый текущим LLM_PROVIDER."""
+        keys = {"cloudru": self.cloudru_api_key, "openrouter": self.openrouter_api_key}
+        if self.llm_provider == "auto":
+            return any(keys.values())
+        return bool(keys.get(self.llm_provider))

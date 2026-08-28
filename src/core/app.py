@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 
 from agent.agent import SalesAgent
-from agent.client import ChatClient
+from agent.providers import build_router
 from catalog.repository import load_index
 from core.config import Settings
 from core.dialog import DialogEngine
@@ -29,23 +29,11 @@ def build_engine(settings: Settings | None = None) -> DialogEngine:
     storage = Storage(settings.storage_path)
     orders = OrderService(storage, build_sink(settings))
 
+    router = build_router(settings)
     agent = None
-    if settings.llm_enabled:
-        agent = SalesAgent(
-            engine=None,  # проставим после создания движка: агенту нужен сам движок
-            client=ChatClient(
-                api_key=settings.cloudru_api_key,
-                base_url=settings.cloudru_base_url,
-                model=settings.cloudru_model,
-                timeout=settings.llm_timeout_seconds,
-                max_tokens=settings.llm_max_tokens,
-            ),
-        )
-    else:
-        log.warning(
-            "CLOUDRU_API_KEY не задан: бот работает без модели, "
-            "отвечает поиском по каталогу."
-        )
+    if router.configured:
+        # Движок агенту нужен, но сам он создаётся ниже — проставим после.
+        agent = SalesAgent(engine=None, router=router)
 
     dialog_log = DialogLogger(
         path=Path(settings.dialog_log_path),

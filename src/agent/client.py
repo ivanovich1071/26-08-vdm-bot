@@ -1,8 +1,11 @@
-"""Клиент Cloud.ru Foundation Models.
+"""Клиент модели по протоколу OpenAI.
 
-API совместим с OpenAI, но зависимость от пакета `openai` здесь не нужна: используются
-только `/v1/chat/completions` с вызовом инструментов. Обращение через стандартную
-библиотеку избавляет прототип от лишних зависимостей и делает поведение при таймаутах
+Один и тот же класс работает и с Cloud.ru Foundation Models, и с OpenRouter: оба
+принимают `/v1/chat/completions` с вызовом инструментов. Отличаются адресом, ключом,
+названием модели и парой заголовков — всё это поля, а не отдельный код.
+
+Зависимость от пакета `openai` здесь не нужна: обращение через стандартную библиотеку
+избавляет прототип от лишних зависимостей и делает поведение при таймаутах
 и ошибках предсказуемым.
 """
 
@@ -12,7 +15,7 @@ import json
 import logging
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -22,6 +25,10 @@ class LLMError(RuntimeError):
     """Модель не ответила. Диалог должен продолжиться без неё, а не оборваться."""
 
 
+class LLMAuthError(LLMError):
+    """Ключ не принят или на счету нет средств. Повторять запрос бессмысленно."""
+
+
 @dataclass
 class ChatClient:
     api_key: str
@@ -29,6 +36,17 @@ class ChatClient:
     model: str = "deepseek-ai/DeepSeek-V4-Flash"
     timeout: float = 60.0
     max_tokens: int = 1200
+    # Как провайдер называется в логах и в диагностике: «cloudru», «openrouter».
+    name: str = "cloudru"
+    # OpenRouter просит указать, откуда пришёл запрос; Cloud.ru лишние заголовки
+    # игнорирует, поэтому отдельной ветки в коде не нужно.
+    extra_headers: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def host(self) -> str:
+        from urllib.parse import urlparse
+
+        return urlparse(self.base_url).hostname or ""
 
     def complete(
         self,
@@ -46,13 +64,15 @@ class ChatClient:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
 
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            **self.extra_headers,
+        }
         request = urllib.request.Request(
             f"{self.base_url.rstrip('/')}/chat/completions",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
+            headers=headers,
             method="POST",
         )
         try:
@@ -60,11 +80,16 @@ class ChatClient:
                 body = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:400]
-            raise LLMError(f"Cloud.ru вернул {exc.code}: {detail}") from exc
+            message = f"{self.name} вернул {exc.code}: {detail}"
+            # 401 — не тот ключ, 402 — нет средств, 403 — ключу закрыт доступ.
+            # Пробовать ещё раз или ждать паузу смысла нет, нужен человек.
+            if exc.code in {401, 402, 403}:
+                raise LLMAuthError(message) from exc
+            raise LLMError(message) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise LLMError(f"Cloud.ru недоступен: {exc}") from exc
+            raise LLMError(f"{self.name} недоступен: {exc}") from exc
 
         choices = body.get("choices") or []
         if not choices:
-            raise LLMError("Пустой ответ модели")
+            raise LLMError(f"{self.name}: пустой ответ модели")
         return choices[0]["message"]

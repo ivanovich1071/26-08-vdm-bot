@@ -1,6 +1,7 @@
 """Точка запуска без установки пакета.
 
     python run.py ingest --source data/raw/Pricelist20260826.xlsx
+    python run.py llm                       # проверить провайдеров модели
     python run.py media                     # фотографии с сайта → в базу знаний
     python run.py widget
     python run.py telegram
@@ -31,6 +32,7 @@ def main() -> None:
 
     sub.add_parser("widget", help="поднять веб-виджет и демо-страницу")
     sub.add_parser("telegram", help="запустить Telegram-бота")
+    sub.add_parser("llm", help="проверить провайдеров модели по шагам")
 
     search = sub.add_parser("search", help="проверить поиск из консоли")
     search.add_argument("query")
@@ -98,6 +100,15 @@ def main() -> None:
 
         use_compatible_event_loop()
         asyncio.run(run_bot())
+
+    elif args.command == "llm":
+        from agent.diagnostics import report
+        from agent.providers import build_router
+        from core.config import Settings
+
+        settings = Settings.from_env()
+        print(f"LLM_PROVIDER={settings.llm_provider}")
+        print(report(build_router(settings).clients))
 
     elif args.command == "media":
         _collect_media(args)
