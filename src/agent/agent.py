@@ -4,8 +4,18 @@
 следующего; если легли все — диалог продолжается обычным поиском по каталогу.
 Бот, который молчит из-за недоступности внешнего сервиса, хуже бота без модели.
 
-Персональные данные до модели не доходят: текст маскируется перед отправкой и
-восстанавливается в ответе.
+Персональные данные до модели не доходят: история приходит сюда уже маскированной
+(`core/dialog.Session.remember`), а ответ восстанавливается перед показом.
+
+Две вещи агент делает поверх обычного tool-calling.
+
+**Показывает модели профиль разговора.** Короткая выжимка «что уже известно»
+подставляется в системный промпт. Без неё бот переспрашивал возраст детей, который
+ему назвали ходом раньше, — это видно в журнале диалогов.
+
+**Проверяет цены в ответе.** Всё, что похоже на сумму, должно встречаться среди
+результатов инструментов. Не совпало — просим переписать, а если не помогло,
+отвечаем выдачей каталога. Выдуманная цена дороже молчания.
 """
 
 from __future__ import annotations
@@ -17,8 +27,8 @@ from pathlib import Path
 from agent.client import ChatClient, LLMError
 from agent.providers import LLMRouter
 from agent.tools import TOOL_SCHEMAS, ToolBox
+from agent.verify import invented_prices, prices_in
 from core.ui import Button, Keyboard, Message, ProductCard, Response
-from privacy.masking import Masker
 
 log = logging.getLogger(__name__)
 
@@ -52,12 +62,10 @@ class SalesAgent:
         if not self.available:
             return self.engine.search(session, text)
 
-        masker = Masker()
         tools = ToolBox(self.engine, session)
         messages = [
-            {"role": "system", "content": self.system_prompt},
-            *self._history(session, masker),
-            {"role": "user", "content": masker.mask(text)},
+            {"role": "system", "content": self._system_prompt(session)},
+            *self._history(session),
         ]
 
         try:
@@ -67,8 +75,13 @@ class SalesAgent:
             # только доиграть ход поиском по каталогу.
             return self.engine.search(session, text)
 
-        answer = masker.unmask(answer)
-        session.history.append({"role": "assistant", "content": answer})
+        answer = self._without_invented_prices(answer, messages, tools, text, session)
+        if not answer:
+            return self.engine.search(session, text)
+
+        answer = session.masker.unmask(answer)
+        session.remember("assistant", answer)
+        session.profile.remember_offered(_unique(tools.shown_skus))
         return self._render(session, tools, answer, text)
 
     # --- Цикл вызова инструментов -------------------------------------------
@@ -121,6 +134,50 @@ class SalesAgent:
         )
         return (client.complete(messages).get("content") or "").strip()
 
+    # --- Проверка ответа -------------------------------------------------------
+
+    def _without_invented_prices(  # noqa: ANN001
+        self, answer: str, messages: list[dict], tools: ToolBox, question: str, session
+    ) -> str:
+        """Ответ, в котором каждая сумма подтверждена данными.
+
+        Одна попытка исправиться: модель почти всегда переписывает ответ честно,
+        когда ей называют конкретные лишние числа. Если и второй ответ выдуман,
+        возвращаем пустую строку — вызывающая сторона ответит выдачей каталога.
+        """
+        allowed = tools.prices | prices_in(question) | prices_in(session.profile.budget or "")
+        invented = invented_prices(answer, allowed)
+        if not invented:
+            return answer
+
+        log.warning(
+            "Модель назвала суммы, которых нет в данных: %s. Просим переписать ответ.",
+            ", ".join(str(price) for price in sorted(invented)),
+        )
+        messages.append({"role": "assistant", "content": answer, "reasoning_content": ""})
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "В твоём ответе есть суммы, которых нет в результатах инструментов: "
+                    + ", ".join(f"{price} ₽" for price in sorted(invented))
+                    + ". Названия и цены товаров бери только из вызовов инструментов. "
+                    "Перепиши ответ: оставь лишь подтверждённые позиции, а чего в "
+                    "каталоге нет — так и скажи."
+                ),
+            }
+        )
+        try:
+            second = self._ask(messages, tools)
+        except LLMError:
+            return ""
+
+        allowed |= tools.prices
+        if invented_prices(second, allowed):
+            log.warning("Ответ выдуман повторно — отвечаем выдачей каталога.")
+            return ""
+        return second
+
     # --- Сборка ответа --------------------------------------------------------
 
     def _render(  # noqa: ANN001
@@ -153,7 +210,6 @@ class SalesAgent:
 
         if not responses:
             # Модель промолчала — отвечаем поиском по исходному вопросу.
-            # Брать последнюю запись истории нельзя: там уже лежит пустой ответ.
             return self.engine.search(session, question)
         return responses
 
@@ -164,10 +220,20 @@ class SalesAgent:
         keyboard.row(Button("Корзина", "cart"), Button("Оформить", "checkout"))
         return keyboard
 
-    def _history(self, session, masker: Masker) -> list[dict]:  # noqa: ANN001
+    def _system_prompt(self, session) -> str:  # noqa: ANN001
+        """Промпт роли плюс то, что уже известно об этом разговоре."""
+        profile = session.profile.as_prompt()
+        return f"{self.system_prompt}\n\n{profile}" if profile else self.system_prompt
+
+    def _history(self, session) -> list[dict]:  # noqa: ANN001
+        """Переписка для модели.
+
+        Маскировать здесь нечего: в сессию реплики попадают уже с метками вместо
+        персональных данных, и на диске лежат в том же виде.
+        """
         history = []
-        for item in session.history[-HISTORY_LIMIT:-1]:
-            message = {"role": item["role"], "content": masker.mask(item["content"])}
+        for item in session.history[-HISTORY_LIMIT:]:
+            message = {"role": item["role"], "content": item["content"]}
             if item["role"] == "assistant":
                 # Само рассуждение не храним, но поле должно присутствовать:
                 # валидатор Cloud.ru требует его у каждого ответа ассистента.

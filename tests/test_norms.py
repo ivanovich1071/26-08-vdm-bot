@@ -1,5 +1,8 @@
+import pytest
+
 from ingest.catalog_tree import CatalogPath
 from norms import documents as docs
+from norms import reference
 from norms.extract import (
     code_anomalies,
     code_from_url,
@@ -124,3 +127,50 @@ def test_anomaly_when_item_code_outside_its_section():
 def test_no_anomaly_for_consistent_code():
     path = school_path()
     assert code_anomalies(path, extract(path=path, url=None, description="")) == []
+
+
+# --- Справка по документам ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "question, expected",
+    [
+        ("что значит 838 приказ", "order_838"),
+        ("что значит закон 1057", "order_1057"),
+        ("приказ 838", "order_838"),
+        ("расскажи про приказ 1057", "order_1057"),
+        ("по чему обязан укомплектовать садик по приказу 1057", "order_1057"),
+        ("обязан ли садик закупать по 1057", "order_1057"),
+        ("что такое ФГОС ДО", "fgos_do"),
+    ],
+)
+def test_question_about_a_document_is_recognised(question, expected):
+    assert reference.question_about_document(question) == expected
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "что нужно в кабинет логопеда по приказу 838",
+        "подбери оборудование по приказу 838",
+        "покажи товары по приказу 838",
+        "мячи для спортзала",
+        "мячи до 838 рублей",
+        "покажи позицию 2.1.14",
+    ],
+)
+def test_request_for_goods_is_not_a_question_about_a_document(question):
+    assert reference.question_about_document(question) is None
+
+
+def test_reference_names_the_document_and_warns_it_is_not_a_legal_opinion():
+    text = reference.explain("order_838", {"products": 10, "with_code": 10, "codes": 4})
+
+    assert "28 ноября 2024" in text
+    assert "10" in text and "4" in text
+    assert reference.DISCLAIMER in text
+
+
+def test_every_known_document_has_a_reference():
+    for doc_id in reference.known_documents():
+        assert reference.explain(doc_id), doc_id

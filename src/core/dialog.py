@@ -16,6 +16,7 @@ from catalog.models import Product
 from catalog.search import CatalogIndex, SearchHit, SearchQuery
 from core.config import Settings
 from core.models import CartItem, Customer
+from core.profile import DialogProfile
 from core.storage import Storage
 from core.ui import (
     Button,
@@ -30,19 +31,28 @@ from core.ui import (
     stock_text,
 )
 from norms import documents as norm_docs
+from norms import reference as norm_reference
 from orders.service import OrderService
 from privacy.consent import CONSENT_TEXT, CONSENT_VERSION
+from privacy.masking import Masker
 
 log = logging.getLogger(__name__)
 
+# Приветствие открытое: кнопки — подсказка, а не единственный путь. Четыре
+# жёстких сценария на старте отсекали тех, кто пришёл с вопросом, а не с заявкой.
 GREETING = (
-    "Здравствуйте! Помогу подобрать оборудование для детского сада или школы.\n\n"
-    "Можно так:\n"
-    "• назвать, что нужно: «мячи для спортивного зала»;\n"
-    "• указать пункт приказа: «2.1.14» или «п. 2.20.63»;\n"
-    "• спросить, чем оснастить кабинет: «что нужно в кабинет логопеда по приказу 838».\n\n"
-    "Цены и наличие — из выгрузки 1С заказчика."
+    "Здравствуйте! Я консультант ЭЛТИ-КУДИЦ — помогу с оборудованием для детского "
+    "сада или школы.\n\n"
+    "Напишите своими словами, что нужно. Например:\n"
+    "• «чем оснастить спортзал в саду, дети 3–6 лет»;\n"
+    "• «что значит приказ 838» — объясню документ;\n"
+    "• «2.1.14» — покажу позиции по пункту перечня.\n\n"
+    "Можно просто описать задачу — разберёмся вместе. Кнопки ниже, если удобнее ими."
 )
+
+# Сколько реплик разговора храним. Дальше модель всё равно не смотрит, а профиль
+# помнит суть без переписки.
+HISTORY_KEPT = 24
 
 # Поля, которые бот спрашивает при оформлении. Больше не собираем: каждое лишнее
 # поле — это лишние персональные данные, которые придётся защищать и удалять.
@@ -65,8 +75,14 @@ SEARCH_CAP = 50
 class Session:
     """Состояние диалога одного пользователя.
 
-    Живёт в памяти процесса: корзина и заказы лежат в базе, а вот незаконченный
-    ввод контактов переживать перезапуск не обязан — его проще спросить заново.
+    Разделено намеренно. Переписка и профиль переживают перезапуск — иначе бот
+    забывает разговор посреди подбора. А незаконченный ввод контактов не хранится
+    нигде: это чистые персональные данные, и спросить их заново дешевле, чем
+    защищать на диске.
+
+    **История хранится маскированной с момента записи.** Не «замаскируем перед
+    отправкой модели», а именно так: телефон, попавший в переписку, не должен
+    оказаться в базе даже на время.
     """
 
     user_id: str
@@ -76,6 +92,20 @@ class Session:
     customer: Customer = field(default_factory=Customer)
     pending_checkout: bool = False
     history: list[dict[str, str]] = field(default_factory=list)
+    profile: DialogProfile = field(default_factory=DialogProfile)
+    # Один маскер на весь разговор: метки должны совпадать между сообщениями,
+    # иначе модель видит [ИМЯ_1] в истории и [ИМЯ_2] в текущей реплике для
+    # одного и того же человека.
+    masker: Masker = field(default_factory=Masker)
+
+    def remember(self, role: str, content: str) -> None:
+        self.history.append({"role": role, "content": self.masker.mask(content)})
+        del self.history[:-HISTORY_KEPT]
+
+    def forget(self) -> None:
+        self.history.clear()
+        self.profile = DialogProfile()
+        self.masker = Masker()
 
 
 class DialogEngine:
@@ -102,8 +132,34 @@ class DialogEngine:
     def session(self, user_id: str, channel: str) -> Session:
         key = f"{channel}:{user_id}"
         if key not in self._sessions:
-            self._sessions[key] = Session(user_id=user_id, channel=channel)
+            self._sessions[key] = self._restore(user_id, channel)
         return self._sessions[key]
+
+    def _restore(self, user_id: str, channel: str) -> Session:
+        """Разговор, начатый до перезапуска бота.
+
+        Метки маскирования после перезапуска раскрыть нечем — соответствие жило
+        в памяти процесса. Это осознанный размен: ПДн не хранятся, а нераскрытая
+        метка заменяется нейтральным словом при показе (см. `Masker.unmask`).
+        """
+        session = Session(user_id=user_id, channel=channel)
+        try:
+            saved = self.storage.load_dialog_state(user_id, channel)
+        except Exception as exc:  # состояние не должно мешать начать разговор
+            log.warning("Состояние диалога %s не прочитано: %s", user_id, exc)
+            return session
+        if saved:
+            session.history = saved["history"]
+            session.profile = DialogProfile.from_dict(saved["profile"])
+        return session
+
+    def _remember(self, session: Session) -> None:
+        try:
+            self.storage.save_dialog_state(
+                session.user_id, session.channel, session.history, session.profile.to_dict()
+            )
+        except Exception as exc:  # запись состояния не стоит ответа пользователю
+            log.warning("Состояние диалога %s не сохранено: %s", session.user_id, exc)
 
     # --- Точки входа ---------------------------------------------------------
 
@@ -162,10 +218,21 @@ class DialogEngine:
         if session.checkout_step is not None:
             return self._collect_contact(session, text)
 
-        session.history.append({"role": "user", "content": text})
-        if self.agent is not None:
-            return self.agent.reply(session, text)
-        return self.search(session, text)
+        # Профиль обновляем до ответа: то, что человек сказал сейчас, должно
+        # попасть в промпт этого же хода, а не следующего.
+        session.profile.update_from_text(text)
+        session.remember("user", text)
+
+        doc_id = norm_reference.question_about_document(text)
+        if doc_id is not None:
+            responses = self._explain_norm(session, doc_id)
+        elif self.agent is not None:
+            responses = self.agent.reply(session, text)
+        else:
+            responses = self.search(session, text)
+
+        self._remember(session)
+        return responses
 
     def _handle_action(self, user_id: str, channel: str, action: str) -> list[Response]:
         session = self.session(user_id, channel)
@@ -180,6 +247,10 @@ class DialogEngine:
                 return self._by_root(session, arg)
             case "norms":
                 return self._norm_help()
+            case "norm_doc":
+                return self._explain_norm(session, arg)
+            case "norm_items":
+                return self._norm_items(session, arg)
             case "card":
                 return self._card(session, arg)
             case "add":
@@ -400,15 +471,56 @@ class DialogEngine:
         return [self._list(hits[:PAGE_SIZE], root.title(), len(hits), offset=0)]
 
     def _norm_help(self) -> list[Response]:
-        lines = ["Подбор по нормативным перечням. Что можно спросить:", ""]
-        for doc in (norm_docs.ORDER_838, norm_docs.ORDER_1057):
-            lines.append(f"• {doc.full_name or doc.short_name}")
-        lines += [
-            "",
-            "Напишите номер пункта — «2.20.63», «п. 2.1.14» — или подраздел целиком: «2.4».",
-            "Можно словами: «кабинет физики по приказу 838».",
+        keyboard = Keyboard()
+        for doc_id in norm_reference.known_documents():
+            keyboard.row(Button(norm_docs.get(doc_id).short_name, f"norm_doc:{doc_id}"))
+        keyboard.row(Button("Меню", "menu"))
+        return [
+            Message(
+                "По какому документу подбираем? Нажмите — объясню, что это за документ "
+                "и что по нему есть в каталоге.\n\n"
+                "Можно и сразу номером пункта: «2.20.63», «п. 2.1.14» или подраздел «2.4».",
+                keyboard=keyboard,
+            )
         ]
-        return [Message("\n".join(lines), keyboard=self._main_menu())]
+
+    def _explain_norm(self, session: Session, doc_id: str) -> list[Response]:
+        """Справка по документу — без обращения к модели.
+
+        Нормативный вопрос обязан работать всегда, в том числе когда провайдер
+        недоступен: именно на нём отказ модели заметнее всего, а ответ полностью
+        собирается из наших данных.
+        """
+        text = norm_reference.explain(doc_id, norm_reference.coverage(self.index, doc_id))
+        if not text:
+            return [Message("По этому документу справки пока нет.", keyboard=self._main_menu())]
+        if doc_id not in session.profile.norm_doc_ids:
+            session.profile.norm_doc_ids.append(doc_id)
+        session.remember("assistant", text)
+
+        keyboard = Keyboard().row(Button("Показать позиции", f"norm_items:{doc_id}"))
+        keyboard.row(Button("Другой документ", "norms"), Button("Меню", "menu"))
+        return [Message(text, keyboard=keyboard)]
+
+    def _norm_items(self, session: Session, doc_id: str) -> list[Response]:
+        if doc_id not in norm_docs.DOCUMENTS:
+            return [Message("Такого документа нет.", keyboard=self._main_menu())]
+        hits = self.index.search(SearchQuery(text="", norm_doc_id=doc_id, limit=SEARCH_CAP))
+        if not hits:
+            products = [
+                p for p in self.index.products if any(r.doc_id == doc_id for r in p.norms)
+            ][:SEARCH_CAP]
+            hits = [SearchHit(p, 0.0, "text") for p in products]
+        if not hits:
+            return [
+                Message(
+                    "К этому документу в каталоге позиции не привязаны.",
+                    keyboard=self._main_menu(),
+                )
+            ]
+        session.last_hits = hits
+        title = f"{norm_docs.get(doc_id).short_name}: {len(hits)} позиций"
+        return [self._list(hits[:PAGE_SIZE], title, len(hits), offset=0)]
 
     # --- Корзина ---------------------------------------------------------------
 
@@ -600,6 +712,9 @@ class DialogEngine:
             f"• позиций в корзине: {len(data['cart'])}",
             f"• заказов: {len(data['orders'])}",
             f"• записей о согласии: {len(data['consents'])}",
+            f"• сохранённых разговоров: {len(data['dialogs'])} "
+            "(переписка хранится обезличенной — имена и телефоны заменены метками, "
+            "срок хранения 30 дней)",
             "",
             "Удалить всё и отозвать согласие — /delete_data",
         ]
@@ -609,10 +724,14 @@ class DialogEngine:
         self.storage.delete_user_data(session.user_id, session.channel)
         session.customer = Customer()
         session.last_hits = []
+        # Переписка и профиль стираются и в памяти процесса: удалить их только
+        # в базе означало бы, что бот всё ещё помнит разговор.
+        session.forget()
         return [
             Message(
-                "Данные удалены, согласие отозвано. Переданные ранее заказы обезличены: "
-                "контакты стёрты, позиции остались у менеджера для учёта.",
+                "Данные удалены, согласие отозвано. Переписка и то, что я о задаче "
+                "запомнил, тоже стёрты. Переданные ранее заказы обезличены: контакты "
+                "удалены, позиции остались у менеджера для учёта.",
                 keyboard=self._main_menu(),
             )
         ]

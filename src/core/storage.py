@@ -16,7 +16,7 @@ import json
 import sqlite3
 import uuid
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from core.models import Cart, CartItem, Customer, Order
@@ -68,7 +68,20 @@ CREATE TABLE IF NOT EXISTS telegram_photos (
     file_id    TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS dialog_state (
+    user_id    TEXT NOT NULL,
+    channel    TEXT NOT NULL,
+    history    TEXT NOT NULL,
+    profile    TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, channel)
+);
 """
+
+# Сколько живёт незавершённый разговор. Дальше он бесполезен: закупка либо
+# состоялась, либо задача изменилась. Заодно это верхняя граница хранения
+# переписки — важная для ФЗ-152, даже с учётом того, что история маскирована.
+DIALOG_TTL_DAYS = 30
 
 
 class Storage:
@@ -283,12 +296,81 @@ class Storage:
         ).fetchone()
         return {key: row[key] or 0 for key in ("total", "with_images", "failed")}
 
+    # --- Состояние диалога ---------------------------------------------------
+
+    def load_dialog_state(self, user_id: str, channel: str) -> dict | None:
+        """История и профиль разговора. Просроченное не отдаём и удаляем.
+
+        История здесь лежит **маскированной**: телефоны и имена заменены метками
+        ещё до записи. Профиль персональных данных не содержит по построению —
+        см. `core/profile.py`.
+        """
+        row = self._db.execute(
+            "SELECT history, profile, updated_at FROM dialog_state "
+            "WHERE user_id = ? AND channel = ?",
+            (user_id, channel),
+        ).fetchone()
+        if row is None:
+            return None
+        if _older_than(row["updated_at"], DIALOG_TTL_DAYS):
+            self.forget_dialog(user_id, channel)
+            return None
+        return {
+            "history": json.loads(row["history"]),
+            "profile": json.loads(row["profile"]),
+            "updated_at": row["updated_at"],
+        }
+
+    def save_dialog_state(
+        self, user_id: str, channel: str, history: list[dict], profile: dict
+    ) -> None:
+        self._db.execute(
+            "INSERT INTO dialog_state(user_id, channel, history, profile, updated_at) "
+            "VALUES(?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id, channel) DO UPDATE SET history = excluded.history, "
+            "profile = excluded.profile, updated_at = excluded.updated_at",
+            (
+                user_id,
+                channel,
+                json.dumps(history, ensure_ascii=False),
+                json.dumps(profile, ensure_ascii=False),
+                _now(),
+            ),
+        )
+        self._db.commit()
+
+    def forget_dialog(self, user_id: str, channel: str | None = None) -> None:
+        if channel is None:
+            self._db.execute("DELETE FROM dialog_state WHERE user_id = ?", (user_id,))
+        else:
+            self._db.execute(
+                "DELETE FROM dialog_state WHERE user_id = ? AND channel = ?", (user_id, channel)
+            )
+        self._db.commit()
+
+    def purge_expired_dialogs(self) -> int:
+        """Удаление просроченных разговоров разом — вызывается при старте.
+
+        Ленивая чистка при чтении не трогает тех, кто больше не пишет, а это как
+        раз те записи, которые обязаны исчезнуть по сроку хранения.
+        """
+        cutoff = _days_ago(DIALOG_TTL_DAYS)
+        cursor = self._db.execute("DELETE FROM dialog_state WHERE updated_at < ?", (cutoff,))
+        self._db.commit()
+        return cursor.rowcount or 0
+
     # --- Права субъекта ПДн --------------------------------------------------
 
     def export_user_data(self, user_id: str) -> dict[str, object]:
         return {
             "user_id": user_id,
             "cart": [asdict(item) for item in self.load_cart(user_id).items],
+            "dialogs": [
+                dict(row)
+                for row in self._db.execute(
+                    "SELECT channel, updated_at FROM dialog_state WHERE user_id = ?", (user_id,)
+                ).fetchall()
+            ],
             "orders": [asdict(order) for order in self.orders_of(user_id)],
             "consents": self.consent_history(user_id),
             "exported_at": _now(),
@@ -300,6 +382,9 @@ class Storage:
         Заказы обезличиваются, а не стираются: строки уже переданы менеджеру и нужны
         для учёта. Контакты при этом удаляются полностью. Сам факт согласия и его
         отзыва остаётся в журнале — иначе нечем подтвердить законность обработки.
+
+        Переписка и профиль разговора удаляются целиком и по всем каналам: в
+        отличие от заказа, для учёта они не нужны.
         """
         for order in self.orders_of(user_id):
             order.customer = Customer()
@@ -309,6 +394,7 @@ class Storage:
                 (json.dumps(asdict(order), ensure_ascii=False), order.id),
             )
         self._db.execute("DELETE FROM carts WHERE user_id = ?", (user_id,))
+        self._db.execute("DELETE FROM dialog_state WHERE user_id = ?", (user_id,))
         self._db.commit()
         self.record_consent(user_id, channel, "n/a", "revoked")
 
@@ -331,3 +417,16 @@ def _order_from_payload(payload: str) -> Order:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _days_ago(days: int) -> str:
+    return (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="seconds")
+
+
+def _older_than(stamp: str, days: int) -> bool:
+    """Сравниваем строки: обе в UTC и в одном формате, разбор дат тут лишний.
+
+    Записи от прежних версий формата просто считаем просроченными — это
+    безопасная сторона ошибки.
+    """
+    return not stamp or stamp < _days_ago(days)

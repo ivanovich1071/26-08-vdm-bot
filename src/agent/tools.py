@@ -15,6 +15,9 @@ from typing import Any
 
 from catalog.search import SearchQuery
 from core.ui import price_text, stock_text
+from norms import documents as norm_docs
+from norms import reference
+from norms.extract import document_ids_in_text
 
 MAX_RESULTS = 8
 
@@ -51,6 +54,32 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {"code": {"type": "string"}},
                 "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "explain_norm",
+            "description": (
+                "Справка по нормативному документу: что это, кого касается, как устроен "
+                "перечень и сколько позиций каталога к нему привязано. Вызывай, когда "
+                "спрашивают про сам документ — «что значит приказ 838», «на основании "
+                "чего обязаны укомплектовать». Отвечай текстом справки, не пересказывая "
+                "документ по памяти."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "document": {
+                        "type": "string",
+                        "description": (
+                            "order_838, order_1057, fgos_do, fop_do, func_kits — "
+                            "либо просто «838», «1057», «ФГОС ДО»"
+                        ),
+                    }
+                },
+                "required": ["document"],
             },
         },
     },
@@ -115,6 +144,9 @@ class ToolBox:
         self.session = session
         self.shown_skus: list[str] = []
         self.handoff_reason: str | None = None
+        # Все суммы, которые инструменты вернули за этот ход. По ним проверяется
+        # ответ модели: цены, которой здесь нет, в ответе быть не должно.
+        self.prices: set[int] = set()
 
     def run(self, name: str, arguments: dict[str, Any]) -> str:
         handler = getattr(self, f"_{name}", None)
@@ -153,13 +185,32 @@ class ToolBox:
                 "found": 0,
                 "note": f"В каталоге нет товаров, привязанных к пункту {code}.",
             }
-        return {"found": len(hits), "products": [self._brief(hit) for hit in hits]}
+        result = {"found": len(hits), "products": [self._brief(hit) for hit in hits]}
+        # Как пункт называется в самом перечне: пользователю это говорит больше,
+        # чем номер, а модели не даёт придумать формулировку самой.
+        title = _item_title(hits, code)
+        if title:
+            result["norm_item_title"] = title
+        return result
+
+    def _explain_norm(self, document: str) -> dict[str, Any]:
+        doc_id = _document_id(document)
+        if doc_id is None:
+            return {
+                "error": f"документ «{document}» не распознан",
+                "known": reference.known_documents(),
+            }
+        return {
+            "document": doc_id,
+            "reference": reference.explain(doc_id, reference.coverage(self.engine.index, doc_id)),
+        }
 
     def _get_product(self, sku_1c: str) -> dict[str, Any]:
         product = self.engine.index.get(sku_1c)
         if product is None:
             return {"error": f"товара с кодом {sku_1c} нет в каталоге"}
         self.shown_skus.append(sku_1c)
+        self._remember_price(product.price)
         norm = product.best_norm()
         return {
             "sku_1c": product.sku_1c,
@@ -183,6 +234,10 @@ class ToolBox:
 
     def _get_cart(self) -> dict[str, Any]:
         cart = self.engine.storage.load_cart(self.session.user_id)
+        self._remember_price(cart.total)
+        for item in cart.items:
+            self._remember_price(item.price)
+            self._remember_price(item.total)
         return {
             "items": [
                 {"sku_1c": i.sku_1c, "name": i.name, "quantity": i.quantity, "sum": i.total}
@@ -198,6 +253,7 @@ class ToolBox:
     def _brief(self, hit) -> dict[str, Any]:  # noqa: ANN001
         product = hit.product
         self.shown_skus.append(product.sku_1c)
+        self._remember_price(product.price)
         return {
             "sku_1c": product.sku_1c,
             "name": product.name,
@@ -206,3 +262,31 @@ class ToolBox:
             "norm": hit.citation(),
             "url": product.url,
         }
+
+    def _remember_price(self, price: int | None) -> None:
+        if price:
+            self.prices.add(int(price))
+        # Цена в ответе почти всегда стоит с разделителем разрядов, а бывает —
+        # округлённой до тысяч. Оба написания читаются как одна и та же сумма,
+        # и придирка к формату превратила бы проверку в источник ложных тревог.
+
+
+def _item_title(hits, code: str) -> str | None:  # noqa: ANN001 — catalog.search.SearchHit
+    for hit in hits:
+        for ref in hit.product.norms:
+            if ref.item_code == code and ref.item_title:
+                return ref.item_title
+    return None
+
+
+def _document_id(name: str) -> str | None:
+    """Идентификатор документа по тому, как его назвала модель.
+
+    Модель зовёт документ и кодом, и номером, и словами — принимаем всё,
+    иначе инструмент отвечает ошибкой на осмысленный вызов.
+    """
+    raw = (name or "").strip().lower()
+    if raw in norm_docs.DOCUMENTS:
+        return raw
+    found = document_ids_in_text(raw) or document_ids_in_text(f"приказ {raw}")
+    return found[0] if found else None

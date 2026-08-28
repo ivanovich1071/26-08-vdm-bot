@@ -212,3 +212,74 @@ def test_unknown_section_says_so(engine):
     responses = engine.handle_action(USER, CHANNEL, "root:999")
 
     assert "нет" in responses[0].text.lower()
+
+
+# --- Нормативная справка и память разговора ---------------------------------
+
+
+def test_norm_question_is_answered_without_the_model(engine):
+    """Провайдер недоступен, а «что значит приказ 838» обязано работать."""
+    engine.agent = None
+    responses = engine.handle_text(USER, CHANNEL, "что значит 838 приказ")
+
+    assert isinstance(responses[0], Message)
+    assert "28 ноября 2024" in responses[0].text
+    assert "справка по данным каталога" in responses[0].text.lower()
+
+
+def test_duty_question_gets_the_reference_not_a_product_list(engine):
+    engine.agent = None
+    responses = engine.handle_text(
+        USER, CHANNEL, "по чему обязан укомплектовать садик по приказу 1057"
+    )
+
+    assert isinstance(responses[0], Message)
+    assert "1057" in responses[0].text
+
+
+def test_request_for_goods_by_norm_is_still_a_search(engine):
+    engine.agent = None
+    responses = engine.handle_text(USER, CHANNEL, "подбери оборудование по приказу 838")
+
+    assert isinstance(responses[0], ProductList)
+
+
+def test_profile_survives_restart_of_the_process(engine, tmp_path):
+    engine.agent = None
+    engine.handle_text(USER, CHANNEL, "нужен спортзал в детском саду, дети 3-6 лет")
+
+    restarted = DialogEngine(engine.index, engine.storage, engine.orders, engine.settings)
+    profile = restarted.session(USER, CHANNEL).profile
+
+    assert profile.room == "спортивный зал"
+    assert profile.age == "3–6 лет"
+
+
+def test_history_reaches_the_disk_masked(engine):
+    engine.agent = None
+    engine.handle_text(USER, CHANNEL, "мой телефон +7 916 330-02-79, нужен мяч")
+
+    saved = engine.storage.load_dialog_state(USER, CHANNEL)
+
+    assert "916" not in json.dumps(saved["history"], ensure_ascii=False)
+    assert "[ТЕЛЕФОН_1]" in json.dumps(saved["history"], ensure_ascii=False)
+
+
+def test_delete_data_wipes_the_conversation(engine):
+    engine.agent = None
+    engine.handle_text(USER, CHANNEL, "нужен спортзал в детском саду")
+    engine.handle_text(USER, CHANNEL, "/delete_data")
+
+    session = engine.session(USER, CHANNEL)
+
+    assert session.history == []
+    assert session.profile.is_empty
+    assert engine.storage.load_dialog_state(USER, CHANNEL) is None
+
+
+def test_norm_menu_offers_every_document_within_the_button_limit(engine):
+    responses = engine.handle_action(USER, CHANNEL, "norms")
+    buttons = [b for row in responses[0].keyboard.rows for b in row]
+
+    assert any(b.action == "norm_doc:order_1057" for b in buttons)
+    assert all(len(b.action.encode()) <= 64 for b in buttons)

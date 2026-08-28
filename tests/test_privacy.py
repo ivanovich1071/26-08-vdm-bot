@@ -6,7 +6,7 @@ def test_phone_is_masked_and_restored():
     masked = masker.mask("Перезвоните на +7 916 330-02-79")
 
     assert "916" not in masked
-    assert masked.endswith("[PHONE_1]")
+    assert masked.endswith("[ТЕЛЕФОН_1]")
     assert masker.unmask(masked) == "Перезвоните на +7 916 330-02-79"
 
 
@@ -19,11 +19,33 @@ def test_email_and_name_are_masked():
     assert not contains_personal_data(masked)
 
 
+def test_name_is_recognised_by_patronymic_and_by_introduction():
+    masker = Masker()
+    assert "Соколова" not in masker.mask("Заведующая Соколова Мария Петровна")
+    assert "Пётр" not in masker.mask("меня зовут Пётр")
+
+
+def test_catalog_words_are_not_mistaken_for_a_name():
+    """Регрессия 28.08: «Дидактический набор» уходил пользователю как «[ИМЯ_1] набор».
+
+    Одного фамильного окончания мало — в названиях товаров таких слов сотни.
+    """
+    masker = Masker()
+    text = 'Дидактический набор "Произносим звуки", Опасные ситуации, Логопедический уголок'
+    assert masker.mask(text) == text
+
+
+def test_unresolved_placeholder_never_reaches_the_user():
+    """После перезапуска соответствия нет — показываем нейтральное слово, не метку."""
+    masker = Masker()
+    assert "[" not in masker.unmask("Перезвоните на [ТЕЛЕФОН_1], [ИМЯ_2]")
+
+
 def test_same_value_gets_one_placeholder():
     masker = Masker()
     masked = masker.mask("тел +7 916 330-02-79 и ещё раз +7 916 330-02-79")
 
-    assert masked.count("[PHONE_1]") == 2
+    assert masked.count("[ТЕЛЕФОН_1]") == 2
     assert len(masker.values) == 1
 
 

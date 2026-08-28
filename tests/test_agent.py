@@ -206,7 +206,7 @@ def test_personal_data_never_leaves_for_the_model(engine):
         sent = json.dumps(cloud.requests[0], ensure_ascii=False)
 
     assert "916" not in sent and "p@example.ru" not in sent and "Петров" not in sent
-    assert "[PHONE_1]" in sent
+    assert "[ТЕЛЕФОН_1]" in sent
 
 
 def test_agent_can_add_to_cart_through_tool(engine):
@@ -269,7 +269,8 @@ def test_prompts_are_sent_as_system_message(engine):
     assert "ЭЛТИ-КУДИЦ" in system["content"]
     # Служебные названия этапов продажи должны быть в промпте, но с запретом
     # показывать их пользователю.
-    assert "никогда не пиши их" in system["content"].lower()
+    assert "служебные" in system["content"].lower()
+    assert "не объявляй" in system["content"].lower()
 
 
 def test_tools_are_declared_to_the_model(engine):
@@ -353,3 +354,74 @@ def test_auth_failure_pauses_the_provider_for_longer(engine):
 
     assert not router.available
     assert router.status()[0]["blocked_for"] > AUTH_COOLDOWN_SECONDS - 5
+
+
+# --- Проверка цен и контекст разговора ---------------------------------------
+
+
+def test_invented_price_is_sent_back_for_a_rewrite(engine):
+    """Регрессия 28.08: модель сочинила пять позиций с ценами, которых нет в данных."""
+    script = [
+        tool_call("search_products", {"query": "станок"}),
+        answer("Мяч резиновый 20 см — 190 ₽, секундомер — 1 990 ₽."),
+        answer("В каталоге по запросу нашёлся станок S1 — 253 000 ₽."),
+    ]
+    with FakeCloudRu(script) as cloud:
+        attach(engine, client(cloud.base_url))
+        responses = engine.handle_text(USER, CHANNEL, "что нужно в спортзал")
+
+    assert "190" not in responses[0].text
+    assert "253 000" in responses[0].text
+    correction = cloud.requests[-1]["messages"][-1]["content"]
+    assert "190" in correction and "1990" in correction.replace(" ", "")
+
+
+def test_twice_invented_answer_falls_back_to_the_catalog(engine):
+    script = [
+        answer("Мяч резиновый — 190 ₽."),
+        answer("Всё равно мяч резиновый — 190 ₽."),
+    ]
+    with FakeCloudRu(script) as cloud:
+        attach(engine, client(cloud.base_url))
+        responses = engine.handle_text(USER, CHANNEL, "нужен станок")
+
+    assert isinstance(responses[0], ProductList)
+
+
+def test_price_from_the_tool_passes_the_check(engine):
+    script = [
+        tool_call("search_products", {"query": "станок"}),
+        answer("Фрезерный станок с ЧПУ — 253 000 ₽, позиция 2.20.63."),
+    ]
+    with FakeCloudRu(script) as cloud:
+        attach(engine, client(cloud.base_url))
+        responses = engine.handle_text(USER, CHANNEL, "нужен станок")
+
+    assert "253 000" in responses[0].text
+    assert len(cloud.requests) == 2, "переписывать честный ответ не нужно"
+
+
+def test_what_the_user_already_said_goes_into_the_system_prompt(engine):
+    script = [answer("Смотрю, что есть."), answer("Вот варианты.")]
+    with FakeCloudRu(script) as cloud:
+        attach(engine, client(cloud.base_url))
+        engine.handle_text(USER, CHANNEL, "оснащаем спортзал в детском саду, дети 3-6 лет")
+        engine.handle_text(USER, CHANNEL, "что посоветуете")
+        system = cloud.requests[-1]["messages"][0]["content"]
+
+    assert "спортивный зал" in system
+    assert "3–6 лет" in system
+    assert "Переспрашивать" in system
+
+
+def test_norm_reference_is_available_as_a_tool(engine):
+    script = [
+        tool_call("explain_norm", {"document": "838"}),
+        answer("Это школьный перечень."),
+    ]
+    with FakeCloudRu(script) as cloud:
+        attach(engine, client(cloud.base_url))
+        engine.handle_text(USER, CHANNEL, "клиент спрашивает про документ")
+        tool_result = [m for m in cloud.requests[-1]["messages"] if m.get("role") == "tool"][0]
+
+    assert "28 ноября 2024" in tool_result["content"]

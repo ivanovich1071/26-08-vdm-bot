@@ -28,6 +28,11 @@ def build_engine(settings: Settings | None = None) -> DialogEngine:
     settings = settings or Settings.from_env()
     index = load_index(settings.kb_path)
     storage = Storage(settings.storage_path)
+    # Срок хранения переписки соблюдается при каждом старте, а не только при
+    # чтении: тот, кто перестал писать, сам за собой не почистит.
+    expired = storage.purge_expired_dialogs()
+    if expired:
+        log.info("Удалено разговоров по сроку хранения: %s", expired)
     orders = OrderService(storage, build_sink(settings))
 
     router = build_router(settings)
