@@ -2,16 +2,21 @@ import pytest
 
 pytest.importorskip("aiogram")
 
+import asyncio  # noqa: E402
+
+from aiogram.exceptions import TelegramNetworkError  # noqa: E402
+
 from adapters.telegram.bot import (  # noqa: E402
     CALLBACK_LIMIT,
     MESSAGE_LIMIT,
+    _reply,
     fit,
     render_card,
     render_list_item,
     to_markup,
 )
 from catalog.models import Product  # noqa: E402
-from core.ui import Button, Keyboard, ProductCard  # noqa: E402
+from core.ui import Button, Keyboard, Message, ProductCard  # noqa: E402
 
 
 def product(**kw):
@@ -187,3 +192,68 @@ def test_card_without_any_photo_gives_none():
     from adapters.telegram.bot import _photo
 
     assert _photo(ProductCard(product=product()), FakeStorage()) is None
+
+
+# --- Обработчик сообщения ------------------------------------------------------
+
+
+class FakeBot:
+    """Бот, у которого индикатор набора всегда обрывается по сети."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send_chat_action(self, chat_id, action):  # noqa: ANN001
+        raise TelegramNetworkError(method=None, message="ClientConnectorError")
+
+    async def send_message(self, chat_id, text, reply_markup=None):  # noqa: ANN001
+        self.sent.append(text)
+
+
+class FakeEngine:
+    storage = None
+
+
+async def test_broken_typing_indicator_does_not_swallow_the_answer():
+    """Регрессия 28.08: бот молчал на сообщения, хотя ответ был готов.
+
+    Сорванный `send_chat_action` уносил с собой весь обработчик — со стороны это
+    выглядело как зависший бот.
+    """
+    bot = FakeBot()
+    await _reply(bot, 1, FakeEngine(), lambda: [Message("Готовый ответ")])
+
+    assert bot.sent == ["Готовый ответ"]
+
+
+async def test_failure_inside_the_core_still_gets_a_human_answer():
+    bot = FakeBot()
+
+    def broken():
+        raise RuntimeError("что-то сломалось в ядре")
+
+    await _reply(bot, 1, FakeEngine(), broken)
+
+    assert bot.sent and "Повторите" in bot.sent[0]
+
+
+async def test_long_answer_does_not_block_the_event_loop():
+    """Ход с обращением к модели идёт минуты — всё это время бот обязан жить."""
+    import time
+
+    bot = FakeBot()
+    ticks = 0
+
+    async def other_work():
+        nonlocal ticks
+        for _ in range(5):
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    await asyncio.gather(
+        _reply(bot, 1, FakeEngine(), lambda: (time.sleep(0.2), [Message("Готово")])[1]),
+        other_work(),
+    )
+
+    assert ticks == 5, "цикл событий стоял, пока считался ответ"
+    assert bot.sent == ["Готово"]

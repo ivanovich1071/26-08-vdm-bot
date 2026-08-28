@@ -267,22 +267,70 @@ def build_dispatcher(engine: DialogEngine) -> Dispatcher:
 
     @dispatcher.message(Command("start"))
     async def on_start(message: TgMessage, bot: Bot) -> None:
-        responses = engine.start(str(message.from_user.id), CHANNEL)
-        await send(bot, message.chat.id, responses, engine.storage)
+        user, chat = str(message.from_user.id), message.chat.id
+        await _reply(bot, chat, engine, lambda: engine.start(user, CHANNEL))
 
     @dispatcher.message(F.text)
     async def on_text(message: TgMessage, bot: Bot) -> None:
-        await bot.send_chat_action(message.chat.id, "typing")
-        responses = engine.handle_text(str(message.from_user.id), CHANNEL, message.text)
-        await send(bot, message.chat.id, responses, engine.storage)
+        user, chat, text = str(message.from_user.id), message.chat.id, message.text
+        await _reply(bot, chat, engine, lambda: engine.handle_text(user, CHANNEL, text))
 
     @dispatcher.callback_query(F.data)
     async def on_callback(query: CallbackQuery, bot: Bot) -> None:
-        await query.answer()
-        responses = engine.handle_action(str(query.from_user.id), CHANNEL, query.data)
-        await send(bot, query.message.chat.id, responses, engine.storage)
+        user, chat, data = str(query.from_user.id), query.message.chat.id, query.data
+        await _quietly(query.answer())
+        await _reply(bot, chat, engine, lambda: engine.handle_action(user, CHANNEL, data))
 
     return dispatcher
+
+
+async def _reply(bot: Bot, chat_id: int, engine: DialogEngine, work) -> None:  # noqa: ANN001
+    """Ответ на сообщение: считаем в отдельном потоке, показываем «печатает».
+
+    Ядро диалога синхронное, а ход с обращением к модели занимает от минуты до
+    трёх. Вызванное прямо в обработчике, оно вставало поперёк цикла событий: бот
+    переставал опрашивать Telegram, не отвечал другим людям и вообще не подавал
+    признаков жизни. Отсюда — отдельный поток.
+
+    Индикатор «печатает» Telegram гасит через пять секунд, поэтому его приходится
+    повторять всё время ожидания. Иначе три минуты тишины выглядят как зависание,
+    чем они, собственно, и выглядели.
+    """
+    typing = asyncio.create_task(_keep_typing(bot, chat_id))
+    try:
+        responses = await asyncio.to_thread(work)
+    except Exception:
+        log.exception("Ход диалога не отработал")
+        responses = [
+            Message("Что-то пошло не так на моей стороне. Повторите, пожалуйста, вопрос.")
+        ]
+    finally:
+        typing.cancel()
+
+    try:
+        await send(bot, chat_id, responses, engine.storage)
+    except TelegramNetworkError as exc:
+        # Ответ уже посчитан, но связь оборвалась. Молчим в чат и остаёмся живыми:
+        # опрос продолжится, а человек повторит вопрос.
+        log.warning("Ответ не доставлен (%s)", exc)
+
+
+async def _keep_typing(bot: Bot, chat_id: int) -> None:
+    while True:
+        await _quietly(bot.send_chat_action(chat_id, "typing"))
+        await asyncio.sleep(4)
+
+
+async def _quietly(coro) -> None:  # noqa: ANN001
+    """Необязательное действие: индикатор набора, подтверждение нажатия.
+
+    Раньше сорванный `send_chat_action` уносил с собой весь обработчик, и человек
+    не получал ответа вовсе — при том что ответ уже был готов.
+    """
+    try:
+        await coro
+    except (TelegramNetworkError, TelegramBadRequest) as exc:
+        log.debug("Служебный вызов не прошёл: %s", exc)
 
 
 def _escape(text: str) -> str:
