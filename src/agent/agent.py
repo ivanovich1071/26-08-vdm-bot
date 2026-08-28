@@ -7,7 +7,7 @@
 Персональные данные до модели не доходят: история приходит сюда уже маскированной
 (`core/dialog.Session.remember`), а ответ восстанавливается перед показом.
 
-Две вещи агент делает поверх обычного tool-calling.
+Три вещи агент делает поверх обычного tool-calling.
 
 **Показывает модели профиль разговора.** Короткая выжимка «что уже известно»
 подставляется в системный промпт. Без неё бот переспрашивал возраст детей, который
@@ -16,6 +16,11 @@
 **Проверяет цены в ответе.** Всё, что похоже на сумму, должно встречаться среди
 результатов инструментов. Не совпало — просим переписать, а если не помогло,
 отвечаем выдачей каталога. Выдуманная цена дороже молчания.
+
+**Дописывает каталог, когда модель обошлась без него.** Ответ списком общих слов —
+«мячи, обручи, скакалки» — промптом не лечится: проверено на живых прогонах.
+Поэтому к такому ответу молча добавляется настоящая выдача поиска, с ценами и
+пунктами перечня.
 """
 
 from __future__ import annotations
@@ -27,8 +32,8 @@ from pathlib import Path
 from agent.client import ChatClient, LLMError
 from agent.providers import LLMRouter
 from agent.tools import TOOL_SCHEMAS, ToolBox
-from agent.verify import invented_prices, prices_in
-from core.ui import Button, Keyboard, Message, ProductCard, Response
+from agent.verify import invented_prices, prices_in, talks_about_goods
+from core.ui import Button, Keyboard, Message, ProductCard, ProductList, Response
 
 log = logging.getLogger(__name__)
 
@@ -211,7 +216,30 @@ class SalesAgent:
         if not responses:
             # Модель промолчала — отвечаем поиском по исходному вопросу.
             return self.engine.search(session, question)
+
+        # Модель перечислила оборудование словами, не заглянув в каталог. Спорить
+        # с ней дорого — целое обращение, — поэтому просто дописываем настоящие
+        # позиции: с ценой, наличием и пунктом перечня.
+        if not tools.shown_skus and talks_about_goods(answer):
+            found = self.engine.search(session, self._catalog_query(session, question))
+            # Пустая выдача сюда не идёт: «ничего не нашёл» сразу после связного
+            # ответа модели выглядит поломкой, а не помощью.
+            if any(isinstance(item, ProductList) for item in found):
+                log.warning("Ответ без обращения к каталогу — дописываем выдачу поиска.")
+                responses += found
         return responses
+
+    def _catalog_query(self, session, question: str) -> str:  # noqa: ANN001
+        """Чем искать, когда искать приходится за модель.
+
+        Реплика пользователя для поиска годится не всегда: «сейчас зал пустой,
+        только ремонт сделали» — это про обстоятельства, а не про товар. Профиль
+        разговора описывает задачу точнее, и он уже разобран.
+        """
+        profile = session.profile
+        words = [profile.room or "", profile.institution or ""]
+        query = " ".join(word for word in words if word).strip()
+        return query or question
 
     def _keyboard(self, tools: ToolBox) -> Keyboard:
         keyboard = Keyboard()

@@ -425,3 +425,41 @@ def test_norm_reference_is_available_as_a_tool(engine):
         tool_result = [m for m in cloud.requests[-1]["messages"] if m.get("role") == "tool"][0]
 
     assert "28 ноября 2024" in tool_result["content"]
+
+
+def test_words_instead_of_a_search_get_real_positions_attached(engine):
+    """Регрессия: модель перечисляла «мячи, обручи, скакалки», не заглянув в каталог."""
+    listing = (
+        "Для спортзала нужно базовое оборудование:\n"
+        "- Мячи разного размера\n"
+        "- Обручи\n"
+        "- Скакалки\n\n"
+        "Хотите, я подберу конкретные позиции?"
+    )
+    with FakeCloudRu([answer(listing)]) as cloud:
+        attach(engine, client(cloud.base_url))
+        responses = engine.handle_text(USER, CHANNEL, "нужен фрезерный станок")
+
+    assert isinstance(responses[0], Message)
+    assert any(isinstance(r, ProductList) for r in responses), "настоящие позиции не показаны"
+
+
+def test_an_answer_built_on_tools_is_left_alone(engine):
+    script = [
+        tool_call("search_products", {"query": "станок"}),
+        answer("- Фрезерный станок с ЧПУ — 253 000 ₽\n- Другой вариант подобрать?"),
+    ]
+    with FakeCloudRu(script) as cloud:
+        attach(engine, client(cloud.base_url))
+        responses = engine.handle_text(USER, CHANNEL, "нужен станок")
+
+    assert not any(isinstance(r, ProductList) for r in responses)
+
+
+def test_empty_search_is_not_appended_to_a_good_answer(engine):
+    """«Ничего не нашёл» сразу после связного ответа выглядит поломкой."""
+    with FakeCloudRu([answer("- Мячи\n- Обручи\n- Скакалки")]) as cloud:
+        attach(engine, client(cloud.base_url))
+        responses = engine.handle_text(USER, CHANNEL, "чем оснастить бассейн")
+
+    assert len(responses) == 1
