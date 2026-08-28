@@ -64,3 +64,6 @@ Thumbs.db
 !.vscode/tasks.json
 !.vscode/extensions.json
 *.log
+
+# Файлы снимков товаров: гигабайт картинок с сайта заказчика.
+data/media/

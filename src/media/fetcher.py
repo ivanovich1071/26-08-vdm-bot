@@ -41,6 +41,7 @@ class FetchResult:
     status: int
     etag: str | None = None
     last_modified: str | None = None
+    content_type: str = ""
 
     @property
     def not_modified(self) -> bool:
@@ -90,6 +91,7 @@ class PageFetcher:
                         status=response.status,
                         etag=response.headers.get("ETag"),
                         last_modified=response.headers.get("Last-Modified"),
+                        content_type=(response.headers.get("Content-Type") or "").lower(),
                     )
             except urllib.error.HTTPError as exc:
                 if exc.code == 304:

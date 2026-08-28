@@ -16,6 +16,7 @@ from core.config import Settings
 from core.dialog import DialogEngine
 from core.storage import Storage
 from media.fetcher import DEFAULT_USER_AGENT, PageFetcher
+from media.files import PhotoStore
 from media.service import MediaService
 from observability.dialog_log import DialogLogger
 from orders.service import OrderService, build_sink
@@ -40,14 +41,16 @@ def build_engine(settings: Settings | None = None) -> DialogEngine:
         enabled=settings.dialog_log_enabled,
         mask_personal_data=settings.dialog_log_mask_pdn,
     )
+    fetcher = PageFetcher(
+        user_agent=settings.media_user_agent or DEFAULT_USER_AGENT,
+        min_interval=settings.media_min_interval,
+        respect_robots=settings.media_respect_robots,
+    )
     media = MediaService(
         storage=storage,
-        fetcher=PageFetcher(
-            user_agent=settings.media_user_agent or DEFAULT_USER_AGENT,
-            min_interval=settings.media_min_interval,
-            respect_robots=settings.media_respect_robots,
-        ),
+        fetcher=fetcher,
         enabled=settings.media_enabled,
+        photos=PhotoStore(fetcher=fetcher, root=Path(settings.media_dir)),
     )
     engine = DialogEngine(
         index, storage, orders, settings, agent=agent, dialog_log=dialog_log, media=media

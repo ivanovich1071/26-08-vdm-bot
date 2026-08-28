@@ -60,6 +60,9 @@ class ProductCard:
     keyboard: Keyboard | None = None
     # Заполняется на лету: в выгрузке 1С изображений нет, они добираются с сайта.
     image: str | None = None
+    # Тот же снимок, уже лежащий у нас на диске. Telegram не может забрать
+    # картинку с vdm.ru сам, поэтому файл ему нужнее адреса.
+    image_path: str | None = None
 
 
 @dataclass

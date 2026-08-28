@@ -97,6 +97,7 @@ class DialogEngine:
         self.dialog_log = dialog_log
         self.media = media
         self._sessions: dict[str, Session] = {}
+        self._roots: list[str] | None = None
 
     def session(self, user_id: str, channel: str) -> Session:
         key = f"{channel}:{user_id}"
@@ -302,8 +303,23 @@ class DialogEngine:
                 citation=norm.citation if norm else None,
                 keyboard=keyboard,
                 image=self._image(product),
+                image_path=self.photo_path(product),
             )
         ]
+
+    def photo_path(self, product: Product) -> str | None:
+        """Снимок, лежащий у нас на диске.
+
+        Telegram не может забрать картинку с vdm.ru сам — отвечает «failed to get
+        HTTP URL content». Поэтому файл для него важнее адреса.
+        """
+        if self.media is None:
+            return None
+        try:
+            return self.media.local_photo(product)
+        except Exception as exc:  # фото не должно ломать ответ
+            log.warning("Локальное фото для %s не найдено: %s", product.sku_1c, exc)
+            return None
 
     def _image(self, product: Product) -> str | None:
         """Фото только для подробной карточки.
@@ -335,19 +351,46 @@ class DialogEngine:
 
     # --- Разделы --------------------------------------------------------------
 
+    @property
+    def roots(self) -> list[str]:
+        """Корневые разделы каталога в порядке появления в выгрузке."""
+        if self._roots is None:
+            found: list[str] = []
+            for product in self.index.products:
+                for root in product.roots:
+                    if root not in found:
+                        found.append(root)
+            self._roots = found
+        return self._roots
+
     def _sections(self) -> list[Response]:
-        roots: list[str] = []
-        for product in self.index.products:
-            for root in product.roots:
-                if root not in roots:
-                    roots.append(root)
         keyboard = Keyboard()
-        for root in roots:
-            keyboard.row(Button(root.title(), f"root:{root}"))
+        # В кнопку кладём номер раздела, а не название: Telegram ограничивает
+        # callback_data 64 байтами, а «ОБОРУДОВАНИЕ ДЛЯ ШКОЛЫ ПО ПРИКАЗУ № 838»
+        # в кириллице занимает вдвое больше — такие кнопки молча пропадали.
+        for number, root in enumerate(self.roots):
+            keyboard.row(Button(root.title(), f"root:{number}"))
         keyboard.row(Button("Подбор по приказу", "norms"), Button("Меню", "menu"))
         return [Message("Выберите раздел каталога:", keyboard=keyboard)]
 
-    def _by_root(self, session: Session, root: str) -> list[Response]:
+    def _by_root(self, session: Session, arg: str) -> list[Response]:
+        root = self._root_by(arg)
+        if root is None:
+            return [Message("Такого раздела нет.", keyboard=self._main_menu())]
+        return self._list_root(session, root)
+
+    def _root_by(self, arg: str) -> str | None:
+        """Номер раздела или его название.
+
+        Название понимаем ради кнопок, нажатых в старых сообщениях: в чате они
+        остаются рабочими и после обновления бота.
+        """
+        if arg.isdigit():
+            number = int(arg)
+            return self.roots[number] if number < len(self.roots) else None
+        return arg if arg in self.roots else None
+
+    def _list_root(self, session: Session, root: str) -> list[Response]:
         hits = self.index.search(SearchQuery(text="", root=root, limit=SEARCH_CAP))
         if not hits:
             # Пустой текст не даёт ранжирования — берём раздел напрямую.

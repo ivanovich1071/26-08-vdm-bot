@@ -16,7 +16,7 @@ import logging
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -93,6 +93,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def action(payload: ActionIn) -> JSONResponse:
         responses = engine.handle_action(payload.session_id, CHANNEL, payload.action)
         return JSONResponse({"responses": to_json(responses)})
+
+    @app.get("/media/{sku_1c}")
+    def product_photo(sku_1c: str) -> FileResponse:
+        """Снимок товара из нашего хранилища.
+
+        Отдаём файл сами, а не ссылаемся на vdm.ru: с части сетей сайт заказчика
+        не открывается, и виджет тогда показывает битую картинку вместо товара.
+        """
+        product = engine.index.get(sku_1c)
+        path = engine.photo_path(product) if product is not None else None
+        if path is None:
+            raise HTTPException(status_code=404, detail="Снимок не собран")
+        return FileResponse(path, headers={"Cache-Control": "public, max-age=86400"})
 
     @app.get("/widget.js")
     def widget_js() -> FileResponse:

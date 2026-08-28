@@ -57,6 +57,17 @@ CREATE TABLE IF NOT EXISTS product_media (
     fetched_at    TEXT NOT NULL,
     failures      INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS product_attributes (
+    sku_1c     TEXT PRIMARY KEY,
+    payload    TEXT NOT NULL,
+    fetched_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS telegram_photos (
+    path       TEXT PRIMARY KEY,
+    sku_1c     TEXT NOT NULL,
+    file_id    TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -218,6 +229,50 @@ class Storage:
             "SELECT sku_1c, images FROM product_media WHERE images != '[]'"
         ).fetchall()
         return {row["sku_1c"]: json.loads(row["images"]) for row in rows}
+
+    # --- Характеристики со страницы товара -----------------------------------
+
+    def save_attributes(self, sku_1c: str, attributes: dict[str, str]) -> None:
+        if not attributes:
+            return
+        self._db.execute(
+            "INSERT INTO product_attributes(sku_1c, payload, fetched_at) VALUES(?, ?, ?) "
+            "ON CONFLICT(sku_1c) DO UPDATE SET payload = excluded.payload, "
+            "fetched_at = excluded.fetched_at",
+            (sku_1c, json.dumps(attributes, ensure_ascii=False), _now()),
+        )
+        self._db.commit()
+
+    def has_attributes(self, sku_1c: str) -> bool:
+        row = self._db.execute(
+            "SELECT 1 FROM product_attributes WHERE sku_1c = ?", (sku_1c,)
+        ).fetchone()
+        return row is not None
+
+    def all_attributes(self) -> dict[str, dict[str, str]]:
+        rows = self._db.execute("SELECT sku_1c, payload FROM product_attributes").fetchall()
+        return {row["sku_1c"]: json.loads(row["payload"]) for row in rows}
+
+    # --- Снимки, уже загруженные в Telegram ----------------------------------
+
+    def telegram_photo(self, path: str) -> str | None:
+        """Идентификатор файла на серверах Telegram.
+
+        Один раз отправленный снимок больше не нужно ни качать с диска, ни
+        загружать заново: повторный показ уходит одним коротким запросом.
+        """
+        row = self._db.execute(
+            "SELECT file_id FROM telegram_photos WHERE path = ?", (path,)
+        ).fetchone()
+        return row["file_id"] if row else None
+
+    def save_telegram_photo(self, path: str, sku_1c: str, file_id: str) -> None:
+        self._db.execute(
+            "INSERT INTO telegram_photos(path, sku_1c, file_id, created_at) VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(path) DO UPDATE SET file_id = excluded.file_id",
+            (path, sku_1c, file_id, _now()),
+        )
+        self._db.commit()
 
     def media_stats(self) -> dict[str, int]:
         row = self._db.execute(

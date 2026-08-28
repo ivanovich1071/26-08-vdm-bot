@@ -174,3 +174,41 @@ def test_result_title_uses_correct_plural(engine, query, expected):
     """Регрессия: заголовок выдачи писал «1 позиций»."""
     responses = engine.handle_text(USER, CHANNEL, query)
     assert expected in responses[0].title
+
+
+def test_catalog_sections_fit_the_telegram_button_limit(engine):
+    """Регрессия: раздел «ОБОРУДОВАНИЕ ДЛЯ ШКОЛЫ ПО ПРИКАЗУ № 838» терял кнопку.
+
+    Telegram отводит под callback_data 64 байта, а кириллица занимает по два
+    на символ — длинные названия разделов в них не помещались, и кнопка молча
+    выбрасывалась при отрисовке.
+    """
+    responses = engine.handle_action(USER, CHANNEL, "catalog")
+    buttons = [b for row in responses[0].keyboard.rows for b in row]
+
+    assert buttons, "разделы каталога не показаны"
+    for button in buttons:
+        assert len(button.action.encode("utf-8")) <= 64, button.action
+
+
+def test_section_opens_by_number(engine):
+    engine.handle_action(USER, CHANNEL, "catalog")
+
+    responses = engine.handle_action(USER, CHANNEL, "root:0")
+
+    assert responses[0].cards, "раздел открылся пустым"
+
+
+def test_old_buttons_with_section_names_still_work(engine):
+    """Кнопки в уже отправленных сообщениях должны пережить обновление бота."""
+    root = engine.roots[0]
+
+    responses = engine.handle_action(USER, CHANNEL, f"root:{root}")
+
+    assert responses[0].cards
+
+
+def test_unknown_section_says_so(engine):
+    responses = engine.handle_action(USER, CHANNEL, "root:999")
+
+    assert "нет" in responses[0].text.lower()

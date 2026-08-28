@@ -37,6 +37,22 @@ _ITEMPROP_IMAGE = re.compile(
 )
 _LARGE_PICTURE = re.compile(r'data-large-picture=["\']([^"\']+)["\']', re.I)
 
+# Характеристики в карточке лежат парами имя-значение в блоке propertyList.
+# Их нет в выгрузке 1С, а в закупке для сада или школы страну и сертификат
+# спрашивают всерьёз — поэтому забираем их тем же проходом, что и фотографии.
+_PROPERTY_LIST = re.compile(r'<div[^>]+class=["\'][^"\']*propertyList[^"\']*["\'][^>]*>', re.I)
+_PROPERTY_PAIR = re.compile(
+    r'propertyName["\'][^>]*>(.*?)</div>.*?propertyValue["\'][^>]*>(.*?)</div>',
+    re.I | re.S,
+)
+_TAGS = re.compile(r"<[^>]+>")
+_SPACES = re.compile(r"\s+")
+MAX_ATTRIBUTES = 20
+
+# На сайте в названиях характеристик попадаются латинские буквы вместо кириллицы
+# («Cтрана» с латинской C). Глазом не отличить, а обращение по ключу ломается.
+_LOOKALIKE = str.maketrans("ACEOPTHKMBXY", "АСЕОРТНКМВХУ")
+
 _TILE = re.compile(r'<div class="item product sku"[^>]*>', re.I)
 _TILE_PRODUCT_ID = re.compile(r'data-product-id=["\'](\d+)["\']', re.I)
 _TILE_LINK = re.compile(r'<a href=["\']([^"\']+)["\'][^>]*class=["\']picture["\']', re.I)
@@ -108,6 +124,28 @@ def extract_from_card(page: str, base_url: str) -> ProductMedia:
     return ProductMedia(images=images, source="card" if images else "")
 
 
+def extract_attributes(page: str) -> dict[str, str]:
+    """Характеристики со страницы товара: страна, сертификат, код.
+
+    Порядок сохраняем такой же, как на сайте: карточка в боте должна читаться
+    так же, как страница, с которой её собрали.
+    """
+    match = _PROPERTY_LIST.search(page)
+    if not match:
+        return {}
+
+    attributes: dict[str, str] = {}
+    for raw_name, raw_value in _PROPERTY_PAIR.findall(page[match.end() :]):
+        name = _plain(raw_name).translate(_LOOKALIKE)
+        value = _plain(raw_value)
+        if not name or not value or name in attributes:
+            continue
+        attributes[name] = value
+        if len(attributes) >= MAX_ATTRIBUTES:
+            break
+    return attributes
+
+
 def extract_from_listing(page: str, base_url: str) -> list[ListingItem]:
     """Товары со страницы списка: идентификатор Битрикса, ссылка и превью.
 
@@ -166,6 +204,10 @@ def _append(images: list[str], path: str, base_url: str) -> None:
     if any(urlparse(url).path == urlparse(known).path for known in images):
         return
     images.append(url)
+
+
+def _plain(html: str) -> str:
+    return _SPACES.sub(" ", unescape(_TAGS.sub(" ", html))).strip(" : ")
 
 
 def _absolute(path: str, base_url: str) -> str | None:

@@ -54,6 +54,9 @@ class Product:
     norms: list[NormRef]
     bitrix_id: int | None
     images: list[str] = field(default_factory=list)
+    # Характеристики со страницы товара: страна, сертификат. В выгрузке 1С их нет,
+    # они добираются тем же проходом, что и фотографии.
+    attributes: dict[str, str] = field(default_factory=dict)
     updated_at: str = ""
 
     @property
@@ -90,5 +93,6 @@ class Product:
             norms=[NormRef.from_dict(n) for n in raw.get("norms", [])],
             bitrix_id=raw.get("bitrix_id"),
             images=raw.get("images", []),
+            attributes=raw.get("attributes", {}),
             updated_at=raw.get("updated_at", ""),
         )

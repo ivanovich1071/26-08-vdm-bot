@@ -48,6 +48,8 @@ def main() -> None:
                        help="только то, что есть в наличии")
     media.add_argument("--sync", action="store_true",
                        help="только перелить накопленное в базу знаний, без обращений к сайту")
+    media.add_argument("--no-files", action="store_true",
+                       help="не скачивать файлы снимков, собрать только адреса")
 
     dialogs = sub.add_parser("dialogs", help="показать записанные диалоги")
     dialogs.add_argument("--last", type=int, default=10, help="сколько последних диалогов")
@@ -146,11 +148,14 @@ def main() -> None:
 
 
 def _collect_media(args) -> None:  # noqa: ANN001 — argparse.Namespace
-    """Сбор фотографий с сайта и запись их в базу знаний.
+    """Сбор фотографий и характеристик с сайта и запись их в базу знаний.
 
     Обход длинный — тысячи карточек по одной в секунду, — поэтому он прерываемый:
     что успели собрать, то и попадает в `products.jsonl`. Повторный запуск
     продолжает с места остановки, потому что уже собранное лежит в кэше.
+
+    Файлы снимков кладутся на диск: Telegram не может забрать картинку с vdm.ru
+    сам, а бот заодно перестаёт зависеть от того, отвечает ли сайт в момент показа.
     """
     from core.app import build_engine
     from core.config import Settings
@@ -162,6 +167,8 @@ def _collect_media(args) -> None:  # noqa: ANN001 — argparse.Namespace
     if args.sync:
         print("Перелито в базу знаний:", sync_to_kb(engine.storage, settings.kb_path))
         return
+
+    engine.media.download_files = not args.no_files
 
     products = engine.index.products
     if args.in_stock:
@@ -177,6 +184,8 @@ def _collect_media(args) -> None:  # noqa: ANN001 — argparse.Namespace
         _walk_cards(engine.media, queue)
 
     print("в кэше:", engine.storage.media_stats())
+    if engine.media.photos is not None:
+        print("файлы снимков:", engine.media.photos.stats())
     print("перелито в базу знаний:", sync_to_kb(engine.storage, settings.kb_path))
 
 
@@ -205,7 +214,9 @@ def _walk_cards(media, queue: list) -> None:  # noqa: ANN001 — media/service.p
 
     try:
         for number, product in enumerate(queue, 1):
-            if media.images_for(product):
+            # `collect`, а не `images_for`: при обходе страница нужна ещё и ради
+            # характеристик, и с неё же скачивается файл снимка.
+            if media.collect(product):
                 done += 1
             else:
                 failed += 1

@@ -93,3 +93,97 @@ def test_overlong_callback_is_dropped_not_sent_broken():
 def test_empty_keyboard_gives_no_markup():
     assert to_markup(None) is None
     assert to_markup(Keyboard()) is None
+
+
+# --- Полная карточка «как на сайте» -------------------------------------------
+
+
+def test_description_is_not_cut_in_the_middle():
+    """Регрессия: описание резалось на 400 символах, у половины каталога — по слову."""
+    text = "Комплект дидактических пособий. " * 40
+    card = render_card(ProductCard(product=product(description=text)))
+
+    assert text.strip() in card
+    assert "…" not in card
+
+
+def test_card_shows_country_and_certificate():
+    """Страну и сертификат в закупке для сада и школы спрашивают всерьёз."""
+    card = render_card(
+        ProductCard(
+            product=product(
+                attributes={"Код": "0Э-00005662", "Страна": "Китай", "Сертификат": "ЕАС"}
+            )
+        )
+    )
+
+    assert "Страна: Китай" in card and "Сертификат: ЕАС" in card
+    # Код 1С уже выведен отдельной строкой — второй раз он не нужен.
+    assert card.count("0Э-00005662") == 0
+    assert "Код 1С: S1" in card
+
+
+def test_whole_kit_is_listed():
+    card = render_card(ProductCard(product=product(kit_contents=[f"поз. {i}" for i in range(12)])))
+
+    assert "поз. 11" in card
+
+
+def test_long_card_still_fits_the_message_limit():
+    card = render_card(ProductCard(product=product(description="Очень длинно. " * 900)))
+
+    assert len(fit(card)) <= MESSAGE_LIMIT
+
+
+# --- Чем отправлять снимок ------------------------------------------------------
+
+
+class FakeStorage:
+    def __init__(self, known=None):
+        self.known = known or {}
+        self.saved = []
+
+    def telegram_photo(self, path):
+        return self.known.get(path)
+
+    def save_telegram_photo(self, path, sku_1c, file_id):
+        self.saved.append((path, sku_1c, file_id))
+
+
+def test_known_file_id_is_reused(tmp_path):
+    from adapters.telegram.bot import _photo
+
+    path = tmp_path / "1.jpg"
+    path.write_bytes(b"jpeg")
+    card = ProductCard(product=product(), image="https://vdm.ru/1.jpg", image_path=str(path))
+
+    assert _photo(card, FakeStorage({str(path): "AgACAgIAAx"})) == "AgACAgIAAx"
+
+
+def test_local_file_beats_the_address(tmp_path):
+    """Telegram не может забрать картинку с vdm.ru сам — файл ему нужнее адреса."""
+    from aiogram.types import FSInputFile
+
+    from adapters.telegram.bot import _photo
+
+    path = tmp_path / "1.jpg"
+    path.write_bytes(b"jpeg")
+    card = ProductCard(product=product(), image="https://vdm.ru/1.jpg", image_path=str(path))
+
+    assert isinstance(_photo(card, FakeStorage()), FSInputFile)
+
+
+def test_address_is_the_last_resort(tmp_path):
+    from adapters.telegram.bot import _photo
+
+    card = ProductCard(
+        product=product(), image="https://vdm.ru/1.jpg", image_path=str(tmp_path / "нет.jpg")
+    )
+
+    assert _photo(card, FakeStorage()) == "https://vdm.ru/1.jpg"
+
+
+def test_card_without_any_photo_gives_none():
+    from adapters.telegram.bot import _photo
+
+    assert _photo(ProductCard(product=product()), FakeStorage()) is None

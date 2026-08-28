@@ -338,9 +338,18 @@ def test_sync_keeps_products_without_photos(tmp_path, storage):
 def test_rebuild_of_knowledge_base_keeps_photos(tmp_path):
     """Регрессия: новая выгрузка 1С обнуляла всё, что собрано с сайта."""
     from ingest.build_kb import Product as KbProduct
-    from ingest.build_kb import _carry_over_images
+    from ingest.build_kb import _carry_over_collected
 
-    path = _kb(tmp_path, [{"sku_1c": "S1", "images": ["https://vdm.ru/a.jpg"]}])
+    path = _kb(
+        tmp_path,
+        [
+            {
+                "sku_1c": "S1",
+                "images": ["https://vdm.ru/a.jpg"],
+                "attributes": {"Страна": "Китай"},
+            }
+        ],
+    )
     fresh = KbProduct(
         sku_1c="S1",
         name="Станок",
@@ -356,9 +365,11 @@ def test_rebuild_of_knowledge_base_keeps_photos(tmp_path):
         bitrix_id=None,
     )
 
-    _carry_over_images([fresh], path)
+    _carry_over_collected([fresh], path)
 
     assert fresh.images == ["https://vdm.ru/a.jpg"]
+    # Характеристики берутся с тех же страниц и стоят ровно столько же времени.
+    assert fresh.attributes == {"Страна": "Китай"}
 
 
 def test_listing_preview_is_upgraded_to_the_full_size_photo(storage):
@@ -408,3 +419,157 @@ def test_walk_stops_when_the_site_goes_down(storage, capsys):
 
     assert service.fetches == 3, "после трёх отказов подряд обход прекращается"
     assert "Сайт не отвечает" in capsys.readouterr().out
+
+
+# --- Характеристики и файлы снимков ---------------------------------------------
+
+
+CARD_WITH_PROPERTIES = """
+<h1>ШР Фрезерно-гравировальный станок</h1>
+<meta property="og:image" content="https://vdm.ru/a/1200_1200_h/1.jpg" />
+<div class="propertyList">
+  <div class="propertyTable">
+    <div class="propertyName">Код</div><div class="propertyValue">0Э-00005662</div>
+  </div>
+  <div class="propertyTable">
+    <div class="propertyName">Cтрана</div><div class="propertyValue">Китай</div>
+  </div>
+  <div class="propertyTable">
+    <div class="propertyName">Сертификат</div><div class="propertyValue">ЕАС</div>
+  </div>
+</div>
+"""
+
+
+def test_attributes_are_read_from_the_card():
+    from media.extract import extract_attributes
+
+    attributes = extract_attributes(CARD_WITH_PROPERTIES)
+
+    assert attributes == {"Код": "0Э-00005662", "Страна": "Китай", "Сертификат": "ЕАС"}
+
+
+def test_latin_lookalikes_in_names_are_fixed():
+    """На сайте «Cтрана» написана с латинской C: глазом не видно, ключ не совпадает."""
+    from media.extract import extract_attributes
+
+    assert "Страна" in extract_attributes(CARD_WITH_PROPERTIES)
+
+
+def test_listing_page_has_no_attributes():
+    from media.extract import extract_attributes
+
+    assert extract_attributes("<div class='item product sku'>мяч</div>") == {}
+
+
+def test_walk_collects_photo_and_attributes_in_one_pass(storage, tmp_path):
+    from media.files import PhotoStore
+
+    fetcher = StubFetcher(FetchResult(body=CARD_WITH_PROPERTIES.encode(), status=200))
+    service = MediaService(
+        storage,
+        fetcher,
+        enabled=True,
+        photos=PhotoStore(fetcher=fetcher, root=tmp_path / "media"),
+        download_files=False,
+    )
+
+    assert service.collect(product()) == ["https://vdm.ru/a/1200_1200_h/1.jpg"]
+    assert storage.all_attributes()["S1"]["Сертификат"] == "ЕАС"
+
+
+def test_second_walk_does_not_touch_the_site_again(storage, tmp_path):
+    """Обход прерываемый: повторный запуск не переоткрывает готовые карточки."""
+    from media.files import PhotoStore
+
+    fetcher = StubFetcher(FetchResult(body=CARD_WITH_PROPERTIES.encode(), status=200))
+    service = MediaService(
+        storage, fetcher, enabled=True, photos=PhotoStore(fetcher, tmp_path / "media")
+    )
+    service.download_files = False
+
+    service.collect(product())
+    service.collect(product())
+
+    assert fetcher.calls == 1
+
+
+def test_photo_is_saved_as_a_file(tmp_path):
+    from media.files import PhotoStore
+
+    fetcher = StubFetcher(
+        FetchResult(body=b"\xff\xd8\xff\x00jpeg", status=200, content_type="image/jpeg")
+    )
+    store = PhotoStore(fetcher=fetcher, root=tmp_path)
+
+    saved = store.download("0Э-00005662", ["https://vdm.ru/a/1200_1200_h/1.jpg"])
+
+    assert len(saved) == 1 and saved[0].read_bytes().startswith(b"\xff\xd8")
+    assert saved[0].name == "1.jpg"
+    # Код 1С в имени папки — чтобы снимок находился без обращения к базе.
+    assert store.main("0Э-00005662") == saved[0]
+
+
+def test_already_downloaded_photo_is_not_fetched_twice(tmp_path):
+    from media.files import PhotoStore
+
+    fetcher = StubFetcher(FetchResult(body=b"jpeg", status=200, content_type="image/jpeg"))
+    store = PhotoStore(fetcher=fetcher, root=tmp_path)
+
+    store.download("S1", ["https://vdm.ru/1.jpg"])
+    store.download("S1", ["https://vdm.ru/1.jpg"])
+
+    assert fetcher.calls == 1
+
+
+def test_page_instead_of_photo_is_not_saved(tmp_path):
+    """Заглушка «страница не найдена» приходит с кодом 200 — под видом снимка её хранить нельзя."""
+    from media.files import PhotoStore
+
+    fetcher = StubFetcher(
+        FetchResult(body=b"<html>404</html>", status=200, content_type="text/html; charset=utf-8")
+    )
+    store = PhotoStore(fetcher=fetcher, root=tmp_path)
+
+    assert store.download("S1", ["https://vdm.ru/1.jpg"]) == []
+    assert store.main("S1") is None
+
+
+def test_interrupted_download_leaves_no_half_photo(tmp_path):
+    from media.files import PhotoStore
+
+    fetcher = StubFetcher(error=FetchError("сеть легла"))
+    store = PhotoStore(fetcher=fetcher, root=tmp_path)
+
+    assert store.download("S1", ["https://vdm.ru/1.jpg"]) == []
+    assert not list(tmp_path.rglob("*.part"))
+
+
+def test_files_are_downloaded_during_the_walk(storage, tmp_path):
+    from media.files import PhotoStore
+
+    fetcher = StubFetcher(FetchResult(body=CARD_WITH_PROPERTIES.encode(), status=200))
+    photos = PhotoStore(fetcher=fetcher, root=tmp_path / "media")
+    service = MediaService(storage, fetcher, enabled=True, photos=photos, download_files=True)
+
+    service.collect(product())
+
+    # Страница и снимок — два обращения; во второй раз файл уже на диске.
+    assert fetcher.calls == 2
+    service.collect(product())
+    assert fetcher.calls == 2
+
+
+def test_local_photo_needs_no_network(storage, tmp_path):
+    """Показ карточки не должен зависеть от того, отвечает ли сайт прямо сейчас."""
+    from media.files import PhotoStore
+
+    folder = tmp_path / "media" / "S1"
+    folder.mkdir(parents=True)
+    (folder / "1.jpg").write_bytes(b"jpeg")
+
+    dead = StubFetcher(error=FetchError("сайт не отвечает"))
+    service = MediaService(storage, dead, enabled=True, photos=PhotoStore(dead, tmp_path / "media"))
+
+    assert service.local_photo(product()).endswith("1.jpg")
+    assert dead.calls == 0

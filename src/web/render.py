@@ -41,8 +41,12 @@ def _one(response: Response) -> dict[str, Any]:
             "norm": response.citation,
             "url": product.url,
             "sku": product.sku_1c,
-            "image": response.image,
-            "kit": product.kit_contents[:10],
+            # Свой файл идёт первым: до vdm.ru браузер посетителя может и не
+            # достучаться, а до нас он уже достучался — виджет с нашей страницы.
+            "image": f"/media/{product.sku_1c}" if response.image_path else response.image,
+            "attributes": product.attributes,
+            "description": product.description,
+            "kit": product.kit_contents,
             "actions": keyboard,
         }
 

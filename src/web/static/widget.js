@@ -47,6 +47,12 @@
     ".vdm-form button{border:0;background:#0b6ab0;color:#fff;padding:0 18px;cursor:pointer}",
     ".vdm-typing{color:#7d8b9c;font-style:italic}",
     ".vdm-total{margin-top:8px;font-weight:600}",
+    ".vdm-photo{display:block;width:100%;max-width:220px;border-radius:8px;margin:6px 0}",
+    ".vdm-props{margin-top:6px;font-size:13px;color:#3d4b5c}",
+    ".vdm-props div{display:flex;gap:6px}",
+    ".vdm-props span:first-child{color:#7d8b9c}",
+    ".vdm-desc{margin-top:6px;font-size:13px;white-space:pre-wrap}",
+    ".vdm-kit{margin:6px 0 0;padding-left:18px;font-size:13px}",
   ].join("");
 
   function el(tag, cls, text) {
@@ -141,11 +147,49 @@
     return box;
   }
 
+  // Подробная карточка приходит с фотографией, характеристиками и составом;
+  // строка в списке выдачи — без них. Отличаем по наличию полей, а не по типу:
+  // ядро отдаёт и то и другое как "item".
   function itemNode(item) {
     var node = el("div", "vdm-item");
+    if (item.image) {
+      var photo = el("img", "vdm-photo");
+      photo.src = item.image;
+      photo.alt = item.text;
+      photo.loading = "lazy";
+      // Снимок мог не собраться — тогда убираем картинку, а не показываем
+      // сломанный значок поверх карточки.
+      photo.onerror = function () {
+        photo.remove();
+      };
+      node.appendChild(photo);
+    }
     node.appendChild(el("b", null, item.text));
     if (item.meta) node.appendChild(el("div", "vdm-meta", item.meta));
     if (item.norm) node.appendChild(el("div", "vdm-norm", item.norm));
+
+    var names = Object.keys(item.attributes || {});
+    if (names.length) {
+      var props = el("div", "vdm-props");
+      names.forEach(function (name) {
+        if (name.toLowerCase() === "код") return;
+        var row = el("div");
+        row.appendChild(el("span", null, name + ":"));
+        row.appendChild(el("span", null, item.attributes[name]));
+        props.appendChild(row);
+      });
+      if (props.childNodes.length) node.appendChild(props);
+    }
+
+    if (item.description) node.appendChild(el("div", "vdm-desc", item.description));
+    if (item.kit && item.kit.length) {
+      var list = el("ul", "vdm-kit");
+      item.kit.forEach(function (line) {
+        list.appendChild(el("li", null, line));
+      });
+      node.appendChild(list);
+    }
+
     var acts = actionsNode(item.actions);
     if (acts) node.appendChild(acts);
     return node;

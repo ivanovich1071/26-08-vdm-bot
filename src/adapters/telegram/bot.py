@@ -14,7 +14,7 @@ import logging
 import sys
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
@@ -115,19 +115,34 @@ def to_markup(keyboard: Keyboard | None) -> InlineKeyboardMarkup | None:
 
 
 def render_card(card: ProductCard) -> str:
+    """Карточка так же полно, как на странице сайта.
+
+    Описание не режем: раньше стояла обрезка в 400 символов, и текст обрывался на
+    середине слова у половины каталога. В лимит сообщения его укладывает `fit`,
+    и делает это по границе разметки, а не вслепую.
+    """
     product = card.product
-    lines = [f"<b>{_escape(product.name)}</b>", f"{price_text(product.price)} · {stock_text(product)}"]
+    lines = [
+        f"<b>{_escape(product.name)}</b>",
+        f"{price_text(product.price)} · {stock_text(product)}",
+        f"Код 1С: {_escape(product.sku_1c)}",
+    ]
     if card.citation:
         lines.append(f"Основание: {_escape(card.citation)}")
+
+    # Код в характеристиках дублирует код 1С, он уже выведен строкой выше.
+    extra = [(k, v) for k, v in product.attributes.items() if k.lower() != "код"]
+    if extra:
+        lines.append("")
+        lines += [f"{_escape(name)}: {_escape(value)}" for name, value in extra]
+
     if product.description:
         lines.append("")
-        lines.append(_escape(product.description[:400]))
+        lines.append(_escape(product.description))
     if product.kit_contents:
         lines.append("")
-        lines.append("<b>Состав:</b>")
-        lines += [f"• {_escape(item)}" for item in product.kit_contents[:8]]
-        if len(product.kit_contents) > 8:
-            lines.append(f"…ещё {len(product.kit_contents) - 8}")
+        lines.append("<b>Состав комплекта:</b>")
+        lines += [f"• {_escape(item)}" for item in product.kit_contents]
     return "\n".join(lines)
 
 
@@ -164,13 +179,15 @@ def render_order(summary: OrderSummary) -> str:
     return "\n".join(lines)
 
 
-async def send(bot: Bot, chat_id: int, responses: list[Response]) -> None:
+async def send(
+    bot: Bot, chat_id: int, responses: list[Response], storage=None  # noqa: ANN001
+) -> None:
     for response in responses:
         markup = to_markup(getattr(response, "keyboard", None))
         if isinstance(response, Message):
             await bot.send_message(chat_id, fit(_escape(response.text)), reply_markup=markup)
         elif isinstance(response, ProductCard):
-            await _send_card(bot, chat_id, response, markup)
+            await _send_card(bot, chat_id, response, markup, storage)
         elif isinstance(response, ProductList):
             await bot.send_message(chat_id, fit(render_list_header(response)))
             for card in response.cards:
@@ -184,7 +201,9 @@ async def send(bot: Bot, chat_id: int, responses: list[Response]) -> None:
             await bot.send_message(chat_id, fit(render_order(response)), reply_markup=markup)
 
 
-async def _send_card(bot: Bot, chat_id: int, card: ProductCard, markup) -> None:  # noqa: ANN001
+async def _send_card(  # noqa: ANN001
+    bot: Bot, chat_id: int, card: ProductCard, markup, storage=None
+) -> None:
     """Карточка с фото — одним сообщением, если подпись помещается.
 
     Длинное описание в подпись не влезает, поэтому такой товар показываем как
@@ -193,19 +212,54 @@ async def _send_card(bot: Bot, chat_id: int, card: ProductCard, markup) -> None:
     не должна лишать пользователя карточки.
     """
     text = render_card(card)
-    if not card.image:
+    photo = _photo(card, storage)
+    if photo is None:
         await bot.send_message(chat_id, fit(text), reply_markup=markup)
         return
 
     try:
         if len(text) <= CAPTION_LIMIT:
-            await bot.send_photo(chat_id, card.image, caption=text, reply_markup=markup)
-            return
-        await bot.send_photo(chat_id, card.image)
-        await bot.send_message(chat_id, fit(text), reply_markup=markup)
+            sent = await bot.send_photo(chat_id, photo, caption=text, reply_markup=markup)
+        else:
+            sent = await bot.send_photo(chat_id, photo)
+            await bot.send_message(chat_id, fit(text), reply_markup=markup)
     except TelegramBadRequest as exc:
-        log.warning("Фото %s не отправилось: %s", card.image, exc)
+        log.warning("Фото товара %s не отправилось: %s", card.product.sku_1c, exc)
         await bot.send_message(chat_id, fit(text), reply_markup=markup)
+        return
+
+    _remember_photo(storage, card, sent)
+
+
+def _photo(card: ProductCard, storage):  # noqa: ANN001, ANN202 — тип зависит от aiogram
+    """Чем отправлять снимок, от самого дешёвого способа к самому ненадёжному.
+
+    Адрес на vdm.ru стоит последним не случайно: Telegram ходит за картинкой сам
+    и с его серверов сайт заказчика не открывается — «failed to get HTTP URL
+    content». Поэтому сначала идентификатор уже загруженного файла, потом наш
+    собственный файл на диске, и только затем адрес.
+    """
+    from pathlib import Path
+
+    from aiogram.types import FSInputFile
+
+    if card.image_path and storage is not None:
+        file_id = storage.telegram_photo(card.image_path)
+        if file_id:
+            return file_id
+    if card.image_path and Path(card.image_path).is_file():
+        return FSInputFile(card.image_path)
+    return card.image
+
+
+def _remember_photo(storage, card: ProductCard, sent) -> None:  # noqa: ANN001
+    """Запоминаем файл на серверах Telegram: второй показ уйдёт без загрузки."""
+    if storage is None or not card.image_path:
+        return
+    sizes = getattr(sent, "photo", None)
+    if not sizes:
+        return
+    storage.save_telegram_photo(card.image_path, card.product.sku_1c, sizes[-1].file_id)
 
 
 def build_dispatcher(engine: DialogEngine) -> Dispatcher:
@@ -213,19 +267,20 @@ def build_dispatcher(engine: DialogEngine) -> Dispatcher:
 
     @dispatcher.message(Command("start"))
     async def on_start(message: TgMessage, bot: Bot) -> None:
-        await send(bot, message.chat.id, engine.start(str(message.from_user.id), CHANNEL))
+        responses = engine.start(str(message.from_user.id), CHANNEL)
+        await send(bot, message.chat.id, responses, engine.storage)
 
     @dispatcher.message(F.text)
     async def on_text(message: TgMessage, bot: Bot) -> None:
         await bot.send_chat_action(message.chat.id, "typing")
         responses = engine.handle_text(str(message.from_user.id), CHANNEL, message.text)
-        await send(bot, message.chat.id, responses)
+        await send(bot, message.chat.id, responses, engine.storage)
 
     @dispatcher.callback_query(F.data)
     async def on_callback(query: CallbackQuery, bot: Bot) -> None:
         await query.answer()
         responses = engine.handle_action(str(query.from_user.id), CHANNEL, query.data)
-        await send(bot, query.message.chat.id, responses)
+        await send(bot, query.message.chat.id, responses, engine.storage)
 
     return dispatcher
 
@@ -255,7 +310,26 @@ async def main() -> None:
     bot = Bot(settings.telegram_token, default=_default_properties(), session=_session())
     dispatcher = build_dispatcher(build_engine(settings))
     log.info("Telegram-бот запущен")
-    await dispatcher.start_polling(bot)
+    await _poll_forever(dispatcher, bot)
+
+
+async def _poll_forever(dispatcher: Dispatcher, bot: Bot) -> None:
+    """Опрос, переживающий обрывы связи.
+
+    Внутри опроса aiogram сам повторяет неудачные запросы, но первый же обрыв
+    на старте валил процесс целиком. На нестабильном канале это означало, что
+    бот не поднимается вовсе. Неверный токен сюда не попадает: это отдельная
+    ошибка, и её мы пропускаем наверх, чтобы не крутиться впустую.
+    """
+    pause = 5
+    while True:
+        try:
+            await dispatcher.start_polling(bot)
+            return
+        except TelegramNetworkError as exc:
+            log.warning("Связь с Telegram потеряна (%s). Повтор через %s с.", exc, pause)
+            await asyncio.sleep(pause)
+            pause = min(pause * 2, 60)
 
 
 def _default_properties():  # noqa: ANN202 — тип зависит от версии aiogram

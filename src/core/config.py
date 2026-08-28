@@ -61,6 +61,9 @@ class Settings:
     # Осталось единственное ограничение — частота запросов: это рабочий сайт
     # с живыми покупателями, и класть его своей же выгрузкой незачем.
     media_enabled: bool = True
+    # Куда складываются файлы снимков. Telegram не умеет забирать картинку
+    # с vdm.ru сам, поэтому байты храним у себя.
+    media_dir: str = "data/media"
     media_min_interval: float = 1.0
     media_user_agent: str = ""
     media_respect_robots: bool = False
@@ -105,6 +108,7 @@ class Settings:
             ),
             orders_jsonl_path=env.get("ORDERS_JSONL_PATH", cls.orders_jsonl_path),
             media_enabled=env.get("MEDIA_ENABLED", "1") not in {"0", "false", "no"},
+            media_dir=env.get("MEDIA_DIR", cls.media_dir),
             media_min_interval=float(env.get("MEDIA_MIN_INTERVAL", cls.media_min_interval)),
             media_user_agent=env.get("MEDIA_USER_AGENT", ""),
             media_respect_robots=env.get("MEDIA_RESPECT_ROBOTS", "0")

@@ -21,6 +21,7 @@ from ingest import norm_registry
 from ingest.catalog_tree import CatalogPath
 from ingest.html_text import html_to_text, split_kit_contents
 from ingest.xlsx_reader import XlsxFile
+from media.sync import collected_in_kb
 from norms import documents as norm_docs
 from norms.extract import SOURCE_WEIGHTS, NormLink, code_anomalies, extract, root_document_id
 
@@ -57,6 +58,8 @@ class Product:
     norms: list[dict[str, Any]]
     bitrix_id: int | None
     images: list[str] = field(default_factory=list)
+    # Страна, сертификат — со страницы товара. В выгрузке 1С этих полей нет.
+    attributes: dict[str, str] = field(default_factory=dict)
     sources: dict[str, str] = field(default_factory=dict)
     updated_at: str = ""
 
@@ -74,6 +77,7 @@ class Report:
     with_kit_contents: int = 0
     with_bitrix_id: int = 0
     with_images: int = 0
+    with_attributes: int = 0
     with_norms: int = 0
     with_norm_item_code: int = 0
     from_registry: int = 0
@@ -96,7 +100,7 @@ def build(source: Path, out_dir: Path) -> Report:
 
     kb_file = out_dir / "products.jsonl"
     _apply_registry(products, report)
-    _carry_over_images(products, kb_file)
+    _carry_over_collected(products, kb_file)
     _fill_report(report, products)
     _write_jsonl(kb_file, products)
     (out_dir / "report.json").write_text(
@@ -244,6 +248,7 @@ def _fill_report(report: Report, products: list[Product]) -> None:
         report.with_kit_contents += bool(product.kit_contents)
         report.with_bitrix_id += product.bitrix_id is not None
         report.with_images += bool(product.images)
+        report.with_attributes += bool(product.attributes)
         if product.norms:
             report.with_norms += 1
         if any(norm["item_code"] for norm in product.norms):
@@ -312,28 +317,25 @@ def _apply_registry(products: list[Product], report: Report) -> None:
             ]
 
 
-def _carry_over_images(products: list[Product], previous: Path) -> None:
-    """Сохраняет фотографии, собранные до этой пересборки.
+def _carry_over_collected(products: list[Product], previous: Path) -> None:
+    """Сохраняет собранное с сайта до этой пересборки: фотографии и характеристики.
 
-    Выгрузка приходит два-три раза в месяц, а фотографии берутся с сайта отдельным
-    проходом. Без переноса каждая новая выгрузка обнуляла бы собранное, и обход
-    сайта пришлось бы начинать заново.
+    Выгрузка приходит два-три раза в месяц, а с сайта всё берётся отдельным
+    проходом длиной в полтора часа. Без переноса каждая новая выгрузка обнуляла
+    бы собранное, и обход пришлось бы начинать заново.
     """
     if not previous.exists():
         return
 
-    known: dict[str, list[str]] = {}
-    with previous.open(encoding="utf-8") as fh:
-        for line in fh:
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            if row.get("images"):
-                known[row["sku_1c"]] = row["images"]
-
+    known = collected_in_kb(previous)
     for product in products:
+        kept = known.get(product.sku_1c)
+        if not kept:
+            continue
         if not product.images:
-            product.images = known.get(product.sku_1c, [])
+            product.images = kept.get("images", [])
+        if not product.attributes:
+            product.attributes = kept.get("attributes", {})
 
 
 def _write_jsonl(path: Path, products: list[Product]) -> None:
