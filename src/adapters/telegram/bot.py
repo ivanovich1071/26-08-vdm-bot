@@ -14,6 +14,7 @@ import logging
 import sys
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.middlewares.base import BaseRequestMiddleware
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.filters import Command
 from aiogram.types import (
@@ -315,6 +316,42 @@ async def _reply(bot: Bot, chat_id: int, engine: DialogEngine, work) -> None:  #
         log.warning("Ответ не доставлен (%s)", exc)
 
 
+class RetryOnNetworkError(BaseRequestMiddleware):
+    """Повтор запроса к Telegram при обрыве связи.
+
+    Канал до api.telegram.org с машины разработки рвётся регулярно, и до сих пор
+    это било по самому больному месту: бот получал сообщение, считал ответ — и не
+    мог его отправить. С точки зрения человека бот молчал, хотя работал.
+
+    Повторяем всё, что уходит наружу, включая отправку сообщений и фотографий.
+    Ошибки самого Telegram (неверный запрос, лимиты) сюда не попадают — их
+    повторять бессмысленно, они не про связь.
+    """
+
+    def __init__(self, attempts: int = 3, pause: float = 2.0) -> None:
+        self.attempts = attempts
+        self.pause = pause
+
+    async def __call__(self, make_request, bot, method):  # noqa: ANN001 — тип из aiogram
+        pause = self.pause
+        for attempt in range(1, self.attempts + 1):
+            try:
+                return await make_request(bot, method)
+            except TelegramNetworkError:
+                if attempt == self.attempts:
+                    raise
+                log.info(
+                    "%s не прошёл (попытка %s из %s), повтор через %.0f с",
+                    type(method).__name__,
+                    attempt,
+                    self.attempts,
+                    pause,
+                )
+                await asyncio.sleep(pause)
+                pause *= 2
+        raise AssertionError("недостижимо")  # pragma: no cover
+
+
 async def _keep_typing(bot: Bot, chat_id: int) -> None:
     while True:
         await _quietly(bot.send_chat_action(chat_id, "typing"))
@@ -356,6 +393,7 @@ async def main() -> None:
         raise SystemExit("Не задан TELEGRAM_TOKEN — бот не запускается.")
 
     bot = Bot(settings.telegram_token, default=_default_properties(), session=_session())
+    bot.session.middleware(RetryOnNetworkError())
     dispatcher = build_dispatcher(build_engine(settings))
     log.info("Telegram-бот запущен")
     await _poll_forever(dispatcher, bot)

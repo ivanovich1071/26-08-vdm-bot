@@ -9,6 +9,7 @@ from aiogram.exceptions import TelegramNetworkError  # noqa: E402
 from adapters.telegram.bot import (  # noqa: E402
     CALLBACK_LIMIT,
     MESSAGE_LIMIT,
+    RetryOnNetworkError,
     _reply,
     fit,
     render_card,
@@ -257,3 +258,30 @@ async def test_long_answer_does_not_block_the_event_loop():
 
     assert ticks == 5, "цикл событий стоял, пока считался ответ"
     assert bot.sent == ["Готово"]
+
+
+async def test_send_is_retried_when_the_link_breaks():
+    """Регрессия 28.08: ответ был готов, но не доходил — канал до Telegram рвётся."""
+    calls = 0
+
+    async def make_request(bot, method):  # noqa: ANN001
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise TelegramNetworkError(method=None, message="ClientConnectorError")
+        return "доставлено"
+
+    middleware = RetryOnNetworkError(attempts=3, pause=0.01)
+
+    assert await middleware(make_request, None, object()) == "доставлено"
+    assert calls == 3
+
+
+async def test_hopeless_link_gives_up_instead_of_retrying_forever():
+    async def always_broken(bot, method):  # noqa: ANN001
+        raise TelegramNetworkError(method=None, message="ClientConnectorError")
+
+    middleware = RetryOnNetworkError(attempts=2, pause=0.01)
+
+    with pytest.raises(TelegramNetworkError):
+        await middleware(always_broken, None, object())
