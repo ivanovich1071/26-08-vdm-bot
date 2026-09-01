@@ -44,6 +44,8 @@ def _one(response: Response) -> dict[str, Any]:
             # Свой файл идёт первым: до vdm.ru браузер посетителя может и не
             # достучаться, а до нас он уже достучался — виджет с нашей страницы.
             "image": f"/media/{product.sku_1c}" if response.image_path else response.image,
+            # Все основания с формулировками пунктов приказа — то же, что в Telegram.
+            "norms": response.norms,
             "attributes": product.attributes,
             "description": product.description,
             "kit": product.kit_contents,
@@ -73,8 +75,14 @@ def _one(response: Response) -> dict[str, Any]:
         return {
             "type": "order",
             "lines": [
-                {"name": name, "quantity": quantity, "price": price_text(price)}
-                for name, quantity, price in response.lines
+                {
+                    "name": line.name,
+                    "quantity": line.quantity,
+                    "price": price_text(line.price),
+                    "sku": line.sku_1c,
+                    "norm": line.norm_citation,
+                }
+                for line in response.lines
             ],
             "total": price_text(response.total),
             "note": response.note,

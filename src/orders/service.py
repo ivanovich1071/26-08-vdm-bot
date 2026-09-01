@@ -14,6 +14,7 @@ from orders.sinks import (
     GoogleSheetsSink,
     JsonlSink,
     OrderSink,
+    XlsxSink,
 )
 
 log = logging.getLogger(__name__)
@@ -28,7 +29,14 @@ def build_sink(settings: Settings) -> OrderSink:
     отвалится, заказ всё равно окажется в файле и в базе, и его не придётся искать
     по логам.
     """
-    fallback = JsonlSink(path=Path(settings.orders_jsonl_path))
+    # Спецификация в Excel идёт всегда: пока интеграции с 1С нет, это тот вид, в
+    # котором заказ можно передать менеджеру и завести руками.
+    fallback = CompositeSink(
+        [
+            JsonlSink(path=Path(settings.orders_jsonl_path)),
+            XlsxSink(directory=Path(settings.orders_xlsx_dir)),
+        ]
+    )
     if settings.order_sink == "google_sheets":
         if not settings.google_sheets_id:
             log.warning("ORDER_SINK=google_sheets, но GOOGLE_SHEETS_ID пуст — пишем в файл")

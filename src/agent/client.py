@@ -41,6 +41,11 @@ class ChatClient:
     # OpenRouter просит указать, откуда пришёл запрос; Cloud.ru лишние заголовки
     # игнорирует, поэтому отдельной ветки в коде не нужно.
     extra_headers: dict[str, str] = field(default_factory=dict)
+    # Рубли за миллион токенов — из прайса провайдера. Нужны, чтобы в журнале
+    # стояла стоимость хода, а не только их количество: выбирать модель по
+    # ощущению «эта пободрее» дорого, а по цифрам — нет.
+    price_in: float = 0.0
+    price_out: float = 0.0
 
     @property
     def host(self) -> str:
@@ -92,4 +97,26 @@ class ChatClient:
         choices = body.get("choices") or []
         if not choices:
             raise LLMError(f"{self.name}: пустой ответ модели")
-        return choices[0]["message"]
+
+        # Расход провайдер сообщает в каждом ответе, а мы его выбрасывали — и
+        # посчитать, во сколько обходится один разговор, было нечем. Кладём его
+        # в само сообщение под служебным ключом: сигнатура метода не меняется,
+        # а обратно провайдеру такое сообщение не уходит — там пересобирается
+        # только то, что он прислал сам.
+        message = dict(choices[0]["message"])
+        message["_usage"] = _usage(body, self.model)
+        return message
+
+    @property
+    def usage_prices(self) -> tuple[float, float]:
+        """Рубли за миллион токенов: вход, выход."""
+        return self.price_in, self.price_out
+
+
+def _usage(body: dict[str, Any], model: str) -> dict[str, Any]:
+    raw = body.get("usage") or {}
+    return {
+        "model": model,
+        "tokens_in": int(raw.get("prompt_tokens") or 0),
+        "tokens_out": int(raw.get("completion_tokens") or 0),
+    }

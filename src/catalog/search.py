@@ -17,11 +17,20 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 from catalog.models import Product
-from catalog.text import stems, trigrams
+from catalog.text import expand, stems, trigrams
 from norms.extract import codes_in_query, document_ids_in_text
 
-# Вес поля в BM25: совпадение в названии важнее совпадения в описании.
-FIELD_WEIGHTS = {"name": 3.0, "category": 1.6, "kit": 1.2, "description": 1.0}
+# Вес поля в BM25. Название и раздел каталога описывают товар, описание — уговаривает
+# купить: там встречается всё подряд, от «спортивного духа» до «школьных лет».
+# Пока описание весило почти как название, запрос про спортзал вытаскивал наверх
+# что угодно, где эти слова просто упомянуты.
+FIELD_WEIGHTS = {"name": 4.0, "category": 2.2, "kit": 1.0, "description": 0.7}
+
+# Насколько поднимаем товар из «своей» ветки каталога и опускаем из чужой.
+# Мягко, а не отсечением: жёсткий фильтр по аудитории оставлял бы человека
+# вообще без выдачи там, где заказчик разложил товары иначе, чем мы ожидаем.
+_AUDIENCE_BOOST = 1.6
+_AUDIENCE_PENALTY = 0.55
 
 _K1 = 1.4
 _B = 0.75
@@ -61,6 +70,9 @@ class SearchQuery:
     root: str | None = None
     norm_doc_id: str | None = None
     norm_code: str | None = None
+    # Кому подбираем: preschool | school | None. Не отсекает выдачу, а меняет
+    # порядок и выбор нормативного основания.
+    audience: str | None = None
 
 
 @dataclass
@@ -71,6 +83,8 @@ class SearchHit:
     # Пункт, по которому товар нашёлся. У товара их бывает несколько, и назвать
     # в ответе нужно именно тот, о котором спросили.
     matched_code: str | None = None
+    audience: str | None = None
+    query: str = ""
 
     @property
     def by_norm(self) -> bool:
@@ -81,7 +95,7 @@ class SearchHit:
             for ref in self.product.norms:
                 if ref.item_code == self.matched_code:
                     return ref.citation
-        ref = self.product.best_norm()
+        ref = self.product.norm_for(self.audience, self.query)
         return ref.citation if ref else None
 
 
@@ -145,7 +159,7 @@ class CatalogIndex:
             return []
 
         codes = [query.norm_code] if query.norm_code else codes_in_query(query.text)
-        hits = self._by_norm(codes, allowed)
+        hits = self._by_norm(codes, allowed, query)
         seen = {hit.product.sku_1c for hit in hits}
 
         # Запрос из одного номера пункта («2.1.14») текстом искать нельзя: цифры
@@ -156,14 +170,14 @@ class CatalogIndex:
                     hits.append(hit)
                     seen.add(hit.product.sku_1c)
         elif hits:
-            return hits[: query.limit]
+            return _diversified(hits)[: query.limit]
 
         if len(hits) < query.limit and query.text.strip():
             for hit in self._by_trigram(query, allowed, seen):
                 hits.append(hit)
                 seen.add(hit.product.sku_1c)
 
-        return hits[: query.limit]
+        return _diversified(hits)[: query.limit]
 
     def get(self, sku_1c: str) -> Product | None:
         doc = self._by_sku.get(sku_1c)
@@ -192,14 +206,20 @@ class CatalogIndex:
             allowed.add(doc)
         return allowed
 
-    def _by_norm(self, codes: list[str], allowed: set[int]) -> list[SearchHit]:
+    def _by_norm(
+        self, codes: list[str], allowed: set[int], query: SearchQuery | None = None
+    ) -> list[SearchHit]:
         hits: dict[str, SearchHit] = {}
+        audience = query.audience if query else None
+        text = query.text if query else ""
 
         def keep(doc: int, score: float, code: str) -> None:
             # Товар закрывает несколько пунктов подраздела — в выдаче он один раз.
             sku = self.products[doc].sku_1c
             if sku not in hits:
-                hits[sku] = SearchHit(self.products[doc], score, "norm_code", code)
+                hits[sku] = SearchHit(
+                    self.products[doc], score, "norm_code", code, audience, text
+                )
 
         for code in codes:
             exact = [doc for doc in self._by_norm_code.get(code, ()) if doc in allowed]
@@ -221,6 +241,9 @@ class CatalogIndex:
         tokens = [token for token in stems(query.text) if token not in _STOPWORDS]
         if not tokens:
             return []
+        # «Спортзал» в каталоге называется «спортивный зал», «мастерская» —
+        # «кабинет труда». Раскрываем запрос, а не индекс.
+        tokens = expand(tokens)
 
         scores = self._score(set(tokens), allowed, penalty=1.0)
         if not scores:
@@ -239,8 +262,21 @@ class CatalogIndex:
                 if any(ref.doc_id == doc_id for ref in self.products[doc].norms):
                     scores[doc] *= 1.5
 
+        # Подбираем для сада — школьные позиции опускаем, и наоборот.
+        if query.audience:
+            for doc in list(scores):
+                audiences = self.products[doc].audiences
+                if not audiences:
+                    continue
+                scores[doc] *= (
+                    _AUDIENCE_BOOST if query.audience in audiences else _AUDIENCE_PENALTY
+                )
+
         ranked = sorted(scores.items(), key=lambda item: (-item[1], self.products[item[0]].name))
-        return [SearchHit(self.products[doc], score, "text") for doc, score in ranked]
+        return [
+            SearchHit(self.products[doc], score, "text", None, query.audience, query.text)
+            for doc, score in ranked
+        ]
 
     def _score(self, tokens: set[str], allowed: set[int], penalty: float) -> dict[int, float]:
         total = len(self.products)
@@ -279,7 +315,10 @@ class CatalogIndex:
                 scored.append((similarity, doc))
 
         scored.sort(key=lambda item: (-item[0], self.products[item[1]].name))
-        return [SearchHit(self.products[doc], score, "trigram") for score, doc in scored]
+        return [
+            SearchHit(self.products[doc], score, "trigram", None, query.audience, query.text)
+            for score, doc in scored
+        ]
 
 
 def apply_text_filters(query: SearchQuery) -> SearchQuery:
@@ -317,7 +356,42 @@ def apply_text_filters(query: SearchQuery) -> SearchQuery:
         root=query.root,
         norm_doc_id=query.norm_doc_id,
         norm_code=query.norm_code,
+        audience=query.audience,
     )
+
+
+def _diversified(hits: list[SearchHit]) -> list[SearchHit]:
+    """Перемешивает выдачу так, чтобы подряд не шло одно и то же.
+
+    На «чем оснастить спортзал в саду» бот показывал пять обручей: обруч 60,
+    обруч 70, обруч 60 салатовый… Формально это лучшие совпадения, но человеку
+    нужен зал, а не витрина обручей. Порядок по релевантности сохраняется внутри
+    групп, наверх выносится по одному представителю от каждой.
+    """
+    groups: dict[str, list[SearchHit]] = defaultdict(list)
+    order: list[str] = []
+    for hit in hits:
+        key = _family(hit.product.name)
+        if key not in groups:
+            order.append(key)
+        groups[key].append(hit)
+
+    result: list[SearchHit] = []
+    while len(result) < len(hits):
+        for key in order:
+            if groups[key]:
+                result.append(groups[key].pop(0))
+    return result
+
+
+def _family(name: str) -> str:
+    """Товарная «семья» — по первым значимым словам названия.
+
+    Названия у заказчика начинаются с кода поставщика: «БОС Обруч 60 см».
+    Поэтому берём первые два осмысленных слова, а не одно.
+    """
+    words = [word for word in stems(name) if len(word) > 2 and not word.isdigit()]
+    return " ".join(words[:2]) if words else name.lower()
 
 
 def _to_rubles(phrase: str, digits: str) -> int | None:

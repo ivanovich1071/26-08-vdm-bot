@@ -22,6 +22,7 @@ from core.ui import (
     Button,
     Keyboard,
     Message,
+    OrderLine,
     OrderSummary,
     ProductCard,
     ProductList,
@@ -31,6 +32,7 @@ from core.ui import (
     stock_text,
 )
 from norms import documents as norm_docs
+from norms import items as norm_items
 from norms import reference as norm_reference
 from orders.service import OrderService
 from privacy.consent import CONSENT_TEXT, CONSENT_VERSION
@@ -47,7 +49,25 @@ GREETING = (
     "• «чем оснастить спортзал в саду, дети 3–6 лет»;\n"
     "• «что значит приказ 838» — объясню документ;\n"
     "• «2.1.14» — покажу позиции по пункту перечня.\n\n"
-    "Можно просто описать задачу — разберёмся вместе. Кнопки ниже, если удобнее ими."
+    "Можно просто описать задачу — разберёмся вместе.\n"
+    "Можете воспользоваться кнопками, но это не обязательно."
+)
+
+# Что бот умеет — по команде /help. Приветствие держим коротким, а перечень
+# возможностей выносим сюда: он нужен тому, кто специально его спросил.
+HELP = (
+    "Что я умею:\n\n"
+    "• подобрать оборудование по описанию задачи — «кабинет логопеда в детском саду»;\n"
+    "• найти позиции по пункту перечня — «2.1.14» или «1.13.3»;\n"
+    "• объяснить документ — «что значит приказ 838»;\n"
+    "• собрать корзину и передать заявку менеджеру.\n\n"
+    "Команды:\n"
+    "/start — начать заново\n"
+    "/cart — корзина\n"
+    "/order — оформить заказ\n"
+    "/manager — связаться с менеджером\n"
+    "/my_data — что о вас хранится\n"
+    "/delete_data — удалить данные и отозвать согласие"
 )
 
 # Сколько реплик разговора храним. Дальше модель всё равно не смотрит, а профиль
@@ -65,7 +85,10 @@ CHECKOUT_FIELDS: tuple[tuple[str, str], ...] = (
     ("comment", "Комментарий к заказу (можно «-»):"),
 )
 
-PAGE_SIZE = 5
+# Сколько позиций показываем за раз. Пять оказалось много: заказчик отдельно
+# отметил, что выдача из пяти карточек «излишня». Три помещаются на экран
+# целиком, и каждую можно показать со снимком, не превращая чат в ленту.
+PAGE_SIZE = 3
 # Верхний предел выборки: больше пользователю всё равно не показать,
 # а отдавать в агент сотни позиций дорого и бессмысленно.
 SEARCH_CAP = 50
@@ -97,6 +120,10 @@ class Session:
     # иначе модель видит [ИМЯ_1] в истории и [ИМЯ_2] в текущей реплике для
     # одного и того же человека.
     masker: Masker = field(default_factory=Masker)
+    # Расход модели за текущий ход: токены, обращения, рубли. Живёт в сессии, а не
+    # в агенте, потому что ходы разных людей считаются одновременно, в разных
+    # потоках. В журнал уходит по завершении хода и обнуляется перед следующим.
+    usage: dict[str, object] = field(default_factory=dict)
 
     def remember(self, role: str, content: str) -> None:
         self.history.append({"role": role, "content": self.masker.mask(content)})
@@ -128,6 +155,9 @@ class DialogEngine:
         self.media = media
         self._sessions: dict[str, Session] = {}
         self._roots: list[str] | None = None
+        # Пункты приказов с формулировками. Файла может не быть — тогда бот
+        # называет номер пункта без текста, как и раньше.
+        self._norm_texts = norm_items.load()
 
     def session(self, user_id: str, channel: str) -> Session:
         key = f"{channel}:{user_id}"
@@ -171,7 +201,9 @@ class DialogEngine:
         started = time.monotonic()
         # Шаги сбора контактов — это чистые персональные данные и ничего не дают
         # для настройки промптов. В журнал вместо них идёт отметка о шаге.
-        collecting = self.session(user_id, channel).checkout_step is not None
+        session = self.session(user_id, channel)
+        collecting = session.checkout_step is not None
+        session.usage = {}
         responses = self._handle_text(user_id, channel, text)
         logged = "<контактные данные при оформлении>" if collecting else text
         self._log(user_id, channel, "text", logged, responses, started)
@@ -205,6 +237,7 @@ class DialogEngine:
             mode=mode,
             latency_ms=int((time.monotonic() - started) * 1000),
             cart_count=self.storage.load_cart(user_id).count,
+            usage=self.session(user_id, channel).usage or None,
         )
 
     def _handle_text(self, user_id: str, channel: str, text: str) -> list[Response]:
@@ -261,10 +294,24 @@ class DialogEngine:
                 return self._change(session, arg, -1)
             case "del":
                 return self._change(session, arg, 0, remove=True)
+            case "card_inc":
+                return self._change_on_card(session, arg, +1)
+            case "card_dec":
+                return self._change_on_card(session, arg, -1)
             case "cart":
                 return self._show_cart(session)
             case "clear":
                 return self._clear_cart(session)
+            case "restart":
+                return self._confirm_restart()
+            case "restart_yes":
+                return self._restart(session)
+            case "manager":
+                return self._manager()
+            case "noop":
+                # Надпись с количеством — не кнопка. Telegram всё равно требует
+                # у неё действие, поэтому действие есть, а ответа на него нет.
+                return []
             case "checkout":
                 return self._start_checkout(session)
             case "consent_yes":
@@ -292,22 +339,33 @@ class DialogEngine:
     def _handle_command(self, session: Session, text: str) -> list[Response]:
         command = text.split()[0].lower()
         match command:
-            case "/start" | "/menu":
-                return self.start(session.user_id, session.channel)
+            case "/start":
+                # Начать заново: команда и есть та самая «Перезагрузка». Люди не
+                # догадывались, что для нового подбора надо звать /start, поэтому
+                # теперь она и в меню команд, и по кнопке.
+                return self._restart(session)
+            case "/menu":
+                return [Message("Чем помочь?", keyboard=self._main_menu())]
             case "/cart":
                 return self._show_cart(session)
+            case "/order":
+                return self._start_checkout(session)
+            case "/manager":
+                return self._manager()
             case "/my_data":
                 return self._export_data(session)
             case "/delete_data":
                 return self._delete_data(session)
             case "/help":
-                return [Message(GREETING, keyboard=self._main_menu())]
+                return [Message(HELP, keyboard=self._main_menu())]
         return [Message("Такой команды нет. /help — что умеет бот.", keyboard=self._main_menu())]
 
     # --- Поиск и карточки -----------------------------------------------------
 
     def search(self, session: Session, text: str, limit: int = PAGE_SIZE) -> list[Response]:
-        hits = self.index.search(SearchQuery(text=text, limit=SEARCH_CAP))
+        hits = self.index.search(
+            SearchQuery(text=text, limit=SEARCH_CAP, audience=session.profile.audience)
+        )
         session.last_hits = hits
         if not hits:
             return [
@@ -338,16 +396,21 @@ class DialogEngine:
                     Button("В корзину", f"add:{hit.product.sku_1c}"),
                     Button("Подробнее", f"card:{hit.product.sku_1c}"),
                 ),
+                # Снимок теперь есть и в выдаче. Раньше его не показывали, чтобы
+                # не ходить на сайт заказчика пять раз за один ответ; сейчас файлы
+                # лежат у нас, а позиций в выдаче три, а не пять.
+                image=self._image(hit.product),
+                image_path=self.photo_path(hit.product),
             )
             for hit in hits
         ]
         keyboard = Keyboard()
         if offset + len(hits) < total:
             keyboard.row(Button("Показать ещё", f"more:{offset + len(hits)}"))
-        keyboard.row(Button("Корзина", "cart"), Button("Меню", "menu"))
+        keyboard.row(Button("Моя корзина", "cart"), Button("Меню", "menu"))
         return ProductList(title=title, cards=cards, total_found=total, keyboard=keyboard)
 
-    def _card(self, session: Session, sku: str) -> list[Response]:
+    def _card(self, session: Session, sku: str, replace: bool = False) -> list[Response]:
         product = self.index.get(sku)
         if product is None:
             return [Message("Не нашёл такой товар.", keyboard=self._main_menu())]
@@ -356,17 +419,20 @@ class DialogEngine:
         keyboard = Keyboard()
         if cart_item:
             keyboard.row(
-                Button("−", f"dec:{sku}"),
-                Button(f"{cart_item.quantity} шт.", f"card:{sku}"),
-                Button("+", f"inc:{sku}"),
+                Button("−", f"card_dec:{sku}"),
+                # Количество — надпись, а не кнопка: раньше нажатие на неё
+                # присылало ту же карточку заново, и в чате копились дубли.
+                Button(f"{cart_item.quantity} шт.", "noop"),
+                Button("+", f"card_inc:{sku}"),
             )
         else:
             keyboard.row(Button("В корзину", f"add:{sku}"))
         if product.url:
             keyboard.row(Button("Открыть на сайте", f"card:{sku}", url=product.url))
-        keyboard.row(Button("Корзина", "cart"), Button("Меню", "menu"))
+        keyboard.row(Button("Моя корзина", "cart"), Button("Меню", "menu"))
 
-        norm = product.best_norm()
+        audience = session.profile.audience
+        norm = product.norm_for(audience, session.profile.room or "")
         return [
             ProductCard(
                 product=product,
@@ -375,8 +441,42 @@ class DialogEngine:
                 keyboard=keyboard,
                 image=self._image(product),
                 image_path=self.photo_path(product),
+                norms=self.norm_lines(product, audience),
+                replace=replace,
             )
         ]
+
+    def norm_lines(self, product: Product, audience: str | None) -> list[str]:
+        """Все основания товара с формулировками пунктов приказа.
+
+        Раньше в карточке стоял голый номер — «позиция 2.4.35». Что за ним, было
+        не узнать, не открыв приказ на полутора сотнях страниц. Теперь рядом стоит
+        строка из самого документа.
+
+        Чужой перечень сюда не попадает: школьный пункт не обосновывает закупку
+        для детского сада, и показывать его человеку из сада — это ровно та
+        путаница, на которую жаловался заказчик.
+        """
+        lines: list[str] = []
+        for ref in product.norms_for(audience):
+            item = self._norm_texts.get(ref.doc_id, {}).get(ref.item_code or "")
+            title = item.title if item else ref.item_title
+            line = ref.citation
+            if title:
+                line += f" — {title}"
+            if item and item.section:
+                line += f" ({item.section})"
+            lines.append(line)
+
+        # Молчание об основании читается как «мы не проверяли». Почти половина
+        # каталога к перечням не привязана, и человеку, который собирает закупку,
+        # честный ответ нужнее пустого места.
+        if not lines and audience:
+            where = "дошкольных организаций" if audience == "preschool" else "школ"
+            lines.append(
+                f"в перечнях для {where} эта позиция не числится — уточнит менеджер"
+            )
+        return lines
 
     def photo_path(self, product: Product) -> str | None:
         """Снимок, лежащий у нас на диске.
@@ -462,11 +562,14 @@ class DialogEngine:
         return arg if arg in self.roots else None
 
     def _list_root(self, session: Session, root: str) -> list[Response]:
-        hits = self.index.search(SearchQuery(text="", root=root, limit=SEARCH_CAP))
+        audience = session.profile.audience
+        hits = self.index.search(
+            SearchQuery(text="", root=root, limit=SEARCH_CAP, audience=audience)
+        )
         if not hits:
             # Пустой текст не даёт ранжирования — берём раздел напрямую.
             products = [p for p in self.index.products if root in p.roots][:SEARCH_CAP]
-            hits = [SearchHit(p, 0.0, "text") for p in products]
+            hits = [SearchHit(p, 0.0, "text", None, audience) for p in products]
         session.last_hits = hits
         return [self._list(hits[:PAGE_SIZE], root.title(), len(hits), offset=0)]
 
@@ -505,12 +608,18 @@ class DialogEngine:
     def _norm_items(self, session: Session, doc_id: str) -> list[Response]:
         if doc_id not in norm_docs.DOCUMENTS:
             return [Message("Такого документа нет.", keyboard=self._main_menu())]
-        hits = self.index.search(SearchQuery(text="", norm_doc_id=doc_id, limit=SEARCH_CAP))
+        # Аудиторию берём у самого документа: если человек смотрит перечень для
+        # школ, обосновывать позиции садовским приказом бессмысленно.
+        subject = norm_docs.get(doc_id).subject
+        audience = subject if subject in {"school", "preschool"} else session.profile.audience
+        hits = self.index.search(
+            SearchQuery(text="", norm_doc_id=doc_id, limit=SEARCH_CAP, audience=audience)
+        )
         if not hits:
             products = [
                 p for p in self.index.products if any(r.doc_id == doc_id for r in p.norms)
             ][:SEARCH_CAP]
-            hits = [SearchHit(p, 0.0, "text") for p in products]
+            hits = [SearchHit(p, 0.0, "text", None, audience) for p in products]
         if not hits:
             return [
                 Message(
@@ -530,7 +639,7 @@ class DialogEngine:
             return [Message("Не нашёл такой товар.", keyboard=self._main_menu())]
 
         cart = self.storage.load_cart(session.user_id)
-        norm = product.best_norm()
+        norm = product.norm_for(session.profile.audience, session.profile.room or "")
         cart.add(
             CartItem(
                 sku_1c=product.sku_1c,
@@ -547,9 +656,8 @@ class DialogEngine:
                 f"«{product.name}» добавлен. В корзине {cart.count} шт. "
                 f"на {price_text(cart.total)}.",
                 keyboard=Keyboard().row(
-                    Button("Корзина", "cart"),
+                    Button("Моя корзина", "cart"),
                     Button("Оформить", "checkout"),
-                    Button("Меню", "menu"),
                 ),
             )
         ]
@@ -558,36 +666,61 @@ class DialogEngine:
         cart = self.storage.load_cart(session.user_id)
         item = cart.find(sku)
         if item is None:
-            return self._show_cart(session)
+            return self._show_cart(session, replace=True)
         cart.set_quantity(sku, 0 if remove else item.quantity + delta)
         self.storage.save_cart(cart)
-        return self._show_cart(session)
+        return self._show_cart(session, replace=True)
 
-    def _show_cart(self, session: Session) -> list[Response]:
+    def _change_on_card(self, session: Session, sku: str, delta: int) -> list[Response]:
+        """Количество меняют прямо в карточке товара — её же и обновляем.
+
+        Отдельные действия от корзинных не ради красоты: ответ должен заменить то
+        сообщение, под которым нажали, а это разные сообщения.
+        """
+        cart = self.storage.load_cart(session.user_id)
+        item = cart.find(sku)
+        if item is not None:
+            cart.set_quantity(sku, item.quantity + delta)
+            self.storage.save_cart(cart)
+        return self._card(session, sku, replace=True)
+
+    def _show_cart(self, session: Session, replace: bool = False) -> list[Response]:
         cart = self.storage.load_cart(session.user_id)
         if cart.is_empty:
-            return [Message("Корзина пуста.", keyboard=self._main_menu())]
+            return [Message("Корзина пуста.", keyboard=self._main_menu(), replace=replace)]
 
+        # Название товара живёт в тексте, а не в кнопке. В кнопку Telegram влезает
+        # десятка два символов, и заказчик видел «1 × Сенсом...» вместо позиции.
+        # Кнопки теперь короткие и пронумерованы так же, как строки списка.
         keyboard = Keyboard()
-        for item in cart.items:
+        for number, item in enumerate(cart.items, 1):
             keyboard.row(
-                Button("−", f"dec:{item.sku_1c}"),
-                Button(f"{item.quantity} × {item.name[:24]}", f"card:{item.sku_1c}"),
-                Button("+", f"inc:{item.sku_1c}"),
-                Button("Удалить", f"del:{item.sku_1c}"),
+                Button(f"{number} −", f"dec:{item.sku_1c}"),
+                Button(f"{number}: {item.quantity} шт.", "noop"),
+                Button(f"{number} +", f"inc:{item.sku_1c}"),
+                Button(f"{number} ✕", f"del:{item.sku_1c}"),
             )
         keyboard.row(Button("Оформить заказ", "checkout"), Button("Очистить", "clear"))
-        keyboard.row(Button("Меню", "menu"))
 
         note = None
         if any(item.price is None for item in cart.items):
             note = "По части позиций цена уточняется — менеджер пришлёт её при подтверждении."
         return [
             OrderSummary(
-                lines=[(item.name, item.quantity, item.price) for item in cart.items],
+                lines=[
+                    OrderLine(
+                        name=item.name,
+                        quantity=item.quantity,
+                        price=item.price,
+                        sku_1c=item.sku_1c,
+                        norm_citation=item.norm_citation,
+                    )
+                    for item in cart.items
+                ],
                 total=cart.total,
                 note=note,
                 keyboard=keyboard,
+                replace=replace,
             )
         ]
 
@@ -739,11 +872,59 @@ class DialogEngine:
     # --- Общее -------------------------------------------------------------------
 
     def _main_menu(self) -> Keyboard:
-        return (
-            Keyboard()
-            .row(Button("Каталог", "catalog"), Button("Подбор по приказу", "norms"))
-            .row(Button("Корзина", "cart"), Button("Оформить", "checkout"))
+        """Кнопки под сообщением — только то, чего нет в меню команд.
+
+        Корзина, оформление, помощь и «начать заново» переехали в командное меню
+        Telegram: постоянные четыре кнопки под каждым ответом загромождали окно
+        диалога, а нажать их всё равно можно было только у последнего сообщения.
+        """
+        return Keyboard().row(
+            Button("Каталог", "catalog"),
+            Button("Подбор по приказу", "norms"),
+            Button("Начать заново", "restart"),
         )
+
+    def _confirm_restart(self) -> list[Response]:
+        return [
+            Message(
+                "Начать заново? Я забуду, что мы обсуждали, и очищу корзину.",
+                keyboard=Keyboard().row(
+                    Button("Да, начать заново", "restart_yes"),
+                    Button("Отмена", "menu"),
+                ),
+            )
+        ]
+
+    def _restart(self, session: Session) -> list[Response]:
+        """Чистый лист: ни разговора, ни профиля, ни корзины.
+
+        Пользователи не догадывались, что для нового подбора нужно звать /start,
+        и продолжали прежний разговор — бот помнил старую задачу и подмешивал её
+        в новую. Незаконченное оформление сбрасываем тоже: чужие контакты в чужой
+        заявке хуже, чем лишний вопрос.
+        """
+        cart = self.storage.load_cart(session.user_id)
+        cart.clear()
+        self.storage.save_cart(cart)
+        session.checkout_step = None
+        session.pending_checkout = False
+        session.customer = Customer()
+        session.last_hits = []
+        session.forget()
+        self._remember(session)
+        return [Message(GREETING, keyboard=self._main_menu())]
+
+    def _manager(self) -> list[Response]:
+        return [
+            Message(
+                "Менеджер ЭЛТИ-КУДИЦ ответит на вопросы по срокам, документам и "
+                "нестандартной комплектации.\n\n"
+                f"{self.settings.manager_contact}\n\n"
+                "Если корзина собрана, отправьте заявку — менеджер увидит её со "
+                "всеми позициями и основаниями: /order",
+                keyboard=self._main_menu(),
+            )
+        ]
 
 
 def describe(product: Product) -> str:

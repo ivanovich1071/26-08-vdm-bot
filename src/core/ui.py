@@ -44,6 +44,11 @@ class Keyboard:
 class Message:
     text: str
     keyboard: Keyboard | None = None
+    # Заменить сообщение, под которым нажали кнопку, вместо отправки нового.
+    # Без этого каждое «+» в корзине оставляло в чате ещё одну её копию, и
+    # человек, не видя изменений, жал снова — пять одинаковых карточек подряд
+    # в переписке заказчика появились именно так.
+    replace: bool = False
 
 
 @dataclass
@@ -63,6 +68,11 @@ class ProductCard:
     # Тот же снимок, уже лежащий у нас на диске. Telegram не может забрать
     # картинку с vdm.ru сам, поэтому файл ему нужнее адреса.
     image_path: str | None = None
+    # Все нормативные основания с формулировками пунктов — для подробной карточки.
+    # В строке выдачи показывается одно, в карточке нужны все: по ним собирают
+    # спецификацию, и там важно видеть, сколько позиций перечня товар закрывает.
+    norms: list[str] = field(default_factory=list)
+    replace: bool = False
 
 
 @dataclass
@@ -74,11 +84,28 @@ class ProductList:
 
 
 @dataclass
+class OrderLine:
+    """Строка заказа. Отдельный тип, потому что кортежа перестало хватать.
+
+    Заказчик не мог опознать товар в корзине: название жило внутри кнопки и
+    обрезалось до 24 символов — «1 × Сенсом...». Теперь название и артикул идут
+    текстом, где места сколько угодно, а кнопки остаются короткими.
+    """
+
+    name: str
+    quantity: int
+    price: int | None
+    sku_1c: str = ""
+    norm_citation: str | None = None
+
+
+@dataclass
 class OrderSummary:
-    lines: list[tuple[str, int, int | None]]  # наименование, количество, цена
+    lines: list[OrderLine]
     total: int
     note: str | None = None
     keyboard: Keyboard | None = None
+    replace: bool = False
 
 
 Response = Message | ProductCard | ProductList | OrderSummary

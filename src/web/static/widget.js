@@ -38,10 +38,14 @@
     ".vdm-item b{display:block}",
     ".vdm-meta{color:#5a6a7d;font-size:13px}",
     ".vdm-norm{color:#0b6ab0;font-size:12px;margin-top:2px}",
-    ".vdm-acts{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px}",
+    ".vdm-acts{margin-top:8px;display:flex;flex-direction:column;gap:6px}",
+    ".vdm-acts-row{display:flex;flex-wrap:wrap;gap:6px}",
+    ".vdm-line{margin-top:6px}",
     ".vdm-btn{border:1px solid #0b6ab0;background:#fff;color:#0b6ab0;border-radius:16px;",
     "padding:5px 12px;font-size:13px;cursor:pointer}",
     ".vdm-btn:hover{background:#0b6ab0;color:#fff}",
+    ".vdm-btn-flat{border-color:#d6dee7;color:#5a6a7d;cursor:default}",
+    ".vdm-btn-flat:hover{background:#fff;color:#5a6a7d}",
     ".vdm-form{display:flex;border-top:1px solid #e3e8ee;background:#fff}",
     ".vdm-form input{flex:1;border:0;padding:14px;font-size:14px;outline:none}",
     ".vdm-form button{border:0;background:#0b6ab0;color:#fff;padding:0 18px;cursor:pointer}",
@@ -127,22 +131,33 @@
 
   // --- Отрисовка -----------------------------------------------------------
 
+  // Ряд кнопок — свой контейнер. Раньше все кнопки складывались в один, и
+  // разбиение на ряды терялось: «−», «1 шт.», «+» и «Удалить» от разных товаров
+  // перемешивались в одну ленту, и понять, что к чему относится, было нельзя.
   function actionsNode(rows) {
     if (!rows || !rows.length) return null;
     var box = el("div", "vdm-acts");
     rows.forEach(function (row) {
+      var line = el("div", "vdm-acts-row");
       row.forEach(function (button) {
         var node = el("button", "vdm-btn", button.title);
         node.type = "button";
-        node.onclick = function () {
-          if (button.url) {
-            window.open(button.url, "_blank", "noopener");
-          } else {
-            sendAction(button.action);
-          }
-        };
-        box.appendChild(node);
+        // Надпись с количеством кнопкой только выглядит: нажимать её незачем.
+        if (button.action === "noop") {
+          node.disabled = true;
+          node.className = "vdm-btn vdm-btn-flat";
+        } else {
+          node.onclick = function () {
+            if (button.url) {
+              window.open(button.url, "_blank", "noopener");
+            } else {
+              sendAction(button.action);
+            }
+          };
+        }
+        line.appendChild(node);
       });
+      box.appendChild(line);
     });
     return box;
   }
@@ -166,7 +181,15 @@
     }
     node.appendChild(el("b", null, item.text));
     if (item.meta) node.appendChild(el("div", "vdm-meta", item.meta));
-    if (item.norm) node.appendChild(el("div", "vdm-norm", item.norm));
+    // В подробной карточке — все основания с формулировками пунктов приказа,
+    // в строке выдачи — одно, ближайшее к запросу.
+    if (item.norms && item.norms.length) {
+      item.norms.forEach(function (line) {
+        node.appendChild(el("div", "vdm-norm", line));
+      });
+    } else if (item.norm) {
+      node.appendChild(el("div", "vdm-norm", item.norm));
+    }
 
     var names = Object.keys(item.attributes || {});
     if (names.length) {
@@ -209,10 +232,14 @@
         });
       } else if (response.type === "order") {
         box.appendChild(el("b", null, "Ваш заказ"));
-        response.lines.forEach(function (line) {
-          box.appendChild(
-            el("div", "vdm-meta", line.quantity + " × " + line.name + " — " + line.price)
-          );
+        // Номер строки совпадает с номером на кнопках: иначе непонятно, какому
+        // товару принадлежит «2 −».
+        response.lines.forEach(function (line, index) {
+          box.appendChild(el("div", "vdm-line", index + 1 + ". " + line.name));
+          var tail = "    " + line.quantity + " × " + line.price;
+          if (line.sku) tail += " · код 1С " + line.sku;
+          box.appendChild(el("div", "vdm-meta", tail));
+          if (line.norm) box.appendChild(el("div", "vdm-norm", "    " + line.norm));
         });
         box.appendChild(el("div", "vdm-total", "Итого: " + response.total));
         if (response.note) box.appendChild(el("div", "vdm-meta", response.note));

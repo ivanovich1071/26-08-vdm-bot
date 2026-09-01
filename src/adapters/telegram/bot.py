@@ -16,7 +16,6 @@ import sys
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.middlewares.base import BaseRequestMiddleware
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
-from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -115,6 +114,19 @@ def to_markup(keyboard: Keyboard | None) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
+# Команды в выпадающем меню у поля ввода. Сами команды Telegram принимает только
+# латиницей — это ограничение платформы, а не выбор; подписи русские, и видит
+# человек именно их. Меню разгружает окно диалога: постоянные кнопки «Корзина»
+# и «Оформить» под каждым сообщением заказчик назвал перегрузом.
+COMMANDS: tuple[tuple[str, str], ...] = (
+    ("start", "начать заново"),
+    ("help", "что я умею"),
+    ("cart", "корзина"),
+    ("order", "оформить заказ"),
+    ("manager", "связаться с менеджером"),
+)
+
+
 def render_card(card: ProductCard) -> str:
     """Карточка так же полно, как на странице сайта.
 
@@ -128,7 +140,13 @@ def render_card(card: ProductCard) -> str:
         f"{price_text(product.price)} · {stock_text(product)}",
         f"Код 1С: {_escape(product.sku_1c)}",
     ]
-    if card.citation:
+    # Оснований у товара бывает несколько, и в спецификации важно видеть все:
+    # один комплект закрывает и пункт про словарный запас, и пункт про РАС.
+    if card.norms:
+        lines.append("")
+        lines.append("<b>Основание:</b>")
+        lines += [f"• {_escape(line)}" for line in card.norms]
+    elif card.citation:
         lines.append(f"Основание: {_escape(card.citation)}")
 
     # Код в характеристиках дублирует код 1С, он уже выведен строкой выше.
@@ -169,9 +187,21 @@ def render_list_item(card: ProductCard) -> str:
 
 
 def render_order(summary: OrderSummary) -> str:
+    """Корзина: наименования текстом, номера строк совпадают с номерами кнопок.
+
+    Кнопка Telegram вмещает два десятка символов, и товар в ней превращался в
+    «1 × Сенсом...». В тексте место есть — здесь и стоят полное название, код 1С
+    и нормативное основание, а кнопкам достаётся номер строки.
+    """
     lines = ["<b>Ваш заказ</b>", ""]
-    for name, quantity, price in summary.lines:
-        lines.append(f"• {_escape(name)} — {quantity} × {price_text(price)}")
+    for number, line in enumerate(summary.lines, 1):
+        lines.append(f"<b>{number}.</b> {_escape(line.name)}")
+        tail = f"    {line.quantity} × {price_text(line.price)}"
+        if line.sku_1c:
+            tail += f" · код 1С {_escape(line.sku_1c)}"
+        lines.append(tail)
+        if line.norm_citation:
+            lines.append(f"    {_escape(line.norm_citation)}")
     lines.append("")
     lines.append(f"<b>Итого: {price_text(summary.total)}</b>")
     if summary.note:
@@ -181,10 +211,24 @@ def render_order(summary: OrderSummary) -> str:
 
 
 async def send(
-    bot: Bot, chat_id: int, responses: list[Response], storage=None  # noqa: ANN001
+    bot: Bot,
+    chat_id: int,
+    responses: list[Response],
+    storage=None,  # noqa: ANN001
+    origin: TgMessage | None = None,
 ) -> None:
     for response in responses:
         markup = to_markup(getattr(response, "keyboard", None))
+
+        # Изменение количества правит то сообщение, под которым нажали кнопку.
+        # Раньше каждое «+» присылало новую копию корзины, изменений в ней было
+        # не разглядеть, и человек жал ещё раз — так в чате и появлялись пять
+        # одинаковых карточек подряд.
+        if getattr(response, "replace", False) and origin is not None:
+            text = _replacement_text(response)
+            if text is not None and await _edit(bot, origin, text, markup):
+                continue
+
         if isinstance(response, Message):
             await bot.send_message(chat_id, fit(_escape(response.text)), reply_markup=markup)
         elif isinstance(response, ProductCard):
@@ -192,9 +236,7 @@ async def send(
         elif isinstance(response, ProductList):
             await bot.send_message(chat_id, fit(render_list_header(response)))
             for card in response.cards:
-                await bot.send_message(
-                    chat_id, fit(render_list_item(card)), reply_markup=to_markup(card.keyboard)
-                )
+                await _send_card(bot, chat_id, card, to_markup(card.keyboard), storage, short=True)
             # Навигация по выдаче — последним сообщением, чтобы кнопки были под рукой.
             if markup is not None:
                 await bot.send_message(chat_id, "Что дальше?", reply_markup=markup)
@@ -202,8 +244,50 @@ async def send(
             await bot.send_message(chat_id, fit(render_order(response)), reply_markup=markup)
 
 
+def _replacement_text(response: Response) -> str | None:
+    if isinstance(response, Message):
+        return fit(_escape(response.text))
+    if isinstance(response, ProductCard):
+        return fit(render_card(response))
+    if isinstance(response, OrderSummary):
+        return fit(render_order(response))
+    return None
+
+
+async def _edit(bot: Bot, origin: TgMessage, text: str, markup) -> bool:  # noqa: ANN001
+    """Правка сообщения на месте. Возвращает, получилось ли.
+
+    Не получиться может по-разному: сообщение слишком старое, это подпись к фото,
+    или текст не изменился вовсе. Ни один из случаев не повод потерять ответ —
+    поэтому при неудаче вызывающая сторона просто отправляет новое сообщение.
+    """
+    try:
+        if origin.photo:
+            await bot.edit_message_caption(
+                chat_id=origin.chat.id,
+                message_id=origin.message_id,
+                caption=text[:CAPTION_LIMIT],
+                reply_markup=markup,
+            )
+        else:
+            await bot.edit_message_text(
+                text,
+                chat_id=origin.chat.id,
+                message_id=origin.message_id,
+                reply_markup=markup,
+            )
+        return True
+    except TelegramBadRequest as exc:
+        # «message is not modified» — состояние уже такое, какое просили. Для
+        # человека это успех: ничего не изменилось и меняться не должно было.
+        if "not modified" in str(exc):
+            return True
+        log.debug("Сообщение не удалось изменить: %s", exc)
+        return False
+
+
 async def _send_card(  # noqa: ANN001
-    bot: Bot, chat_id: int, card: ProductCard, markup, storage=None
+    bot: Bot, chat_id: int, card: ProductCard, markup, storage=None, short: bool = False
 ) -> None:
     """Карточка с фото — одним сообщением, если подпись помещается.
 
@@ -211,8 +295,11 @@ async def _send_card(  # noqa: ANN001
     фото и текст раздельно: обрезать состав комплекта хуже, чем разбить на два
     сообщения. Если картинка недоступна, шлём обычный текст — сорванная загрузка
     не должна лишать пользователя карточки.
+
+    `short` — позиция в выдаче: название, цена, основание и снимок. Полное
+    описание там ни к чему, для него есть кнопка «Подробнее».
     """
-    text = render_card(card)
+    text = render_list_item(card) if short else render_card(card)
     photo = _photo(card, storage)
     if photo is None:
         await bot.send_message(chat_id, fit(text), reply_markup=markup)
@@ -266,13 +353,10 @@ def _remember_photo(storage, card: ProductCard, sent) -> None:  # noqa: ANN001
 def build_dispatcher(engine: DialogEngine) -> Dispatcher:
     dispatcher = Dispatcher()
 
-    @dispatcher.message(Command("start"))
-    async def on_start(message: TgMessage, bot: Bot) -> None:
-        user, chat = str(message.from_user.id), message.chat.id
-        await _reply(bot, chat, engine, lambda: engine.start(user, CHANNEL))
-
     @dispatcher.message(F.text)
     async def on_text(message: TgMessage, bot: Bot) -> None:
+        # Команды разбирает ядро: /start одинаково начинает разговор заново и в
+        # Telegram, и в виджете, и правило это должно жить в одном месте.
         user, chat, text = str(message.from_user.id), message.chat.id, message.text
         await _reply(bot, chat, engine, lambda: engine.handle_text(user, CHANNEL, text))
 
@@ -280,12 +364,24 @@ def build_dispatcher(engine: DialogEngine) -> Dispatcher:
     async def on_callback(query: CallbackQuery, bot: Bot) -> None:
         user, chat, data = str(query.from_user.id), query.message.chat.id, query.data
         await _quietly(query.answer())
-        await _reply(bot, chat, engine, lambda: engine.handle_action(user, CHANNEL, data))
+        await _reply(
+            bot,
+            chat,
+            engine,
+            lambda: engine.handle_action(user, CHANNEL, data),
+            origin=query.message,
+        )
 
     return dispatcher
 
 
-async def _reply(bot: Bot, chat_id: int, engine: DialogEngine, work) -> None:  # noqa: ANN001
+async def _reply(  # noqa: ANN001
+    bot: Bot,
+    chat_id: int,
+    engine: DialogEngine,
+    work,
+    origin: TgMessage | None = None,
+) -> None:
     """Ответ на сообщение: считаем в отдельном потоке, показываем «печатает».
 
     Ядро диалога синхронное, а ход с обращением к модели занимает от минуты до
@@ -308,8 +404,12 @@ async def _reply(bot: Bot, chat_id: int, engine: DialogEngine, work) -> None:  #
     finally:
         typing.cancel()
 
+    if not responses:
+        # Нажали надпись, а не кнопку — отвечать нечем и не нужно.
+        return
+
     try:
-        await send(bot, chat_id, responses, engine.storage)
+        await send(bot, chat_id, responses, engine.storage, origin)
     except TelegramNetworkError as exc:
         # Ответ уже посчитан, но связь оборвалась. Молчим в чат и остаёмся живыми:
         # опрос продолжится, а человек повторит вопрос.
@@ -395,8 +495,26 @@ async def main() -> None:
     bot = Bot(settings.telegram_token, default=_default_properties(), session=_session())
     bot.session.middleware(RetryOnNetworkError())
     dispatcher = build_dispatcher(build_engine(settings))
+    await _publish_commands(bot)
     log.info("Telegram-бот запущен")
     await _poll_forever(dispatcher, bot)
+
+
+async def _publish_commands(bot: Bot) -> None:
+    """Список команд в меню у поля ввода.
+
+    Меню — единственное место, где человек видит, что бот вообще что-то умеет
+    помимо переписки. До сих пор про /start знали только те, кому сказали.
+    """
+    from aiogram.types import BotCommand
+
+    commands = [BotCommand(command=name, description=title) for name, title in COMMANDS]
+    try:
+        await bot.set_my_commands(commands)
+    except (TelegramNetworkError, TelegramBadRequest) as exc:
+        # Меню — украшение; бот без него работает, а падать на старте из-за
+        # оборвавшейся сети он не должен.
+        log.warning("Меню команд не опубликовано: %s", exc)
 
 
 async def _poll_forever(dispatcher: Dispatcher, bot: Bot) -> None:

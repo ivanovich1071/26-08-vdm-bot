@@ -50,23 +50,28 @@ class DialogLogger:
         mode: str,
         latency_ms: int,
         cart_count: int,
+        usage: dict | None = None,
     ) -> None:
         if not self.enabled:
             return
         try:
-            self._write(
-                {
-                    "ts": datetime.now(UTC).isoformat(timespec="milliseconds"),
-                    "channel": channel,
-                    "session": self._pseudonym(channel, user_id),
-                    "kind": kind,
-                    "mode": mode,
-                    "latency_ms": latency_ms,
-                    "cart_count": cart_count,
-                    "in": self._clean(incoming),
-                    "out": [self._describe(r) for r in responses],
-                }
-            )
+            record = {
+                "ts": datetime.now(UTC).isoformat(timespec="milliseconds"),
+                "channel": channel,
+                "session": self._pseudonym(channel, user_id),
+                "kind": kind,
+                "mode": mode,
+                "latency_ms": latency_ms,
+                "cart_count": cart_count,
+                "in": self._clean(incoming),
+                "out": [self._describe(r) for r in responses],
+            }
+            # Расход модели за ход. Складывая его по сессии, получаем стоимость
+            # одного пользовательского сценария — то, ради чего это и пишется.
+            # Пользователю цифры не показываются: это данные для разработки.
+            if usage:
+                record["usage"] = usage
+            self._write(record)
         except Exception as exc:  # журнал не должен ломать разговор
             log.warning("Не удалось записать диалог: %s", exc)
 

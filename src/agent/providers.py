@@ -84,6 +84,8 @@ def build_router(settings) -> LLMRouter:  # noqa: ANN001 — core.config.Setting
             timeout=settings.llm_timeout_seconds,
             max_tokens=settings.llm_max_tokens,
             name="cloudru",
+            price_in=settings.cloudru_price_in,
+            price_out=settings.cloudru_price_out,
         )
     if settings.openrouter_api_key:
         clients["openrouter"] = ChatClient(
@@ -93,6 +95,8 @@ def build_router(settings) -> LLMRouter:  # noqa: ANN001 — core.config.Setting
             timeout=settings.llm_timeout_seconds,
             max_tokens=settings.llm_max_tokens,
             name="openrouter",
+            price_in=settings.openrouter_price_in,
+            price_out=settings.openrouter_price_out,
             extra_headers={
                 "HTTP-Referer": settings.site_url,
                 "X-Title": "ELTI-KUDITS catalog bot",

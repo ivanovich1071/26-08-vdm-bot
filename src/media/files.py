@@ -119,6 +119,34 @@ class PhotoStore:
         return {"скачано": self.downloaded, "не вышло": self.failed}
 
 
+def drop_duplicates(root: Path | str = DEFAULT_DIR) -> list[str]:
+    """Убирает одинаковые снимки внутри папки одного товара.
+
+    Сайт отдаёт под разными адресами один и тот же файл, и в карточке товара
+    вторым снимком оказывается копия первого. Одинаковые файлы у **разных**
+    товаров не трогаем: там это законно — один снимок на несколько кодов 1С.
+
+    Возвращает удалённое, чтобы было видно, что именно почищено.
+    """
+    import hashlib
+
+    removed: list[str] = []
+    folder_root = Path(root)
+    if not folder_root.exists():
+        return removed
+
+    for folder in sorted(p for p in folder_root.iterdir() if p.is_dir()):
+        seen: dict[str, Path] = {}
+        for file in sorted(p for p in folder.iterdir() if p.is_file()):
+            digest = hashlib.md5(file.read_bytes()).hexdigest()
+            if digest in seen:
+                file.unlink()
+                removed.append(str(file.relative_to(folder_root)))
+            else:
+                seen[digest] = file
+    return removed
+
+
 def local_paths(root: Path | str = DEFAULT_DIR) -> dict[str, list[str]]:
     """Что уже лежит на диске: код 1С → пути к файлам. Для сборки базы знаний."""
     root = Path(root)

@@ -166,19 +166,29 @@ class ToolBox:
         price_max: int | None = None,
         limit: int = 5,
     ) -> dict[str, Any]:
+        # Аудиторию берём из профиля разговора: без неё поиск для детского сада
+        # поднимал школьные позиции и обосновывал их школьным приказом.
         hits = self.engine.index.search(
             SearchQuery(
                 text=query,
                 in_stock_only=in_stock_only,
                 price_max=price_max,
                 limit=min(limit, MAX_RESULTS),
+                audience=self.session.profile.audience,
             )
         )
         self.session.last_hits = hits
         return {"found": len(hits), "products": [self._brief(hit) for hit in hits]}
 
     def _find_by_norm_code(self, code: str) -> dict[str, Any]:
-        hits = self.engine.index.search(SearchQuery(text=code, norm_code=code, limit=MAX_RESULTS))
+        hits = self.engine.index.search(
+            SearchQuery(
+                text=code,
+                norm_code=code,
+                limit=MAX_RESULTS,
+                audience=self.session.profile.audience,
+            )
+        )
         self.session.last_hits = hits
         if not hits:
             return {
@@ -211,7 +221,7 @@ class ToolBox:
             return {"error": f"товара с кодом {sku_1c} нет в каталоге"}
         self.shown_skus.append(sku_1c)
         self._remember_price(product.price)
-        norm = product.best_norm()
+        norm = product.norm_for(self.session.profile.audience, self.session.profile.room or "")
         return {
             "sku_1c": product.sku_1c,
             "name": product.name,

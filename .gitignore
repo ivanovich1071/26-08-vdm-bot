@@ -4,6 +4,12 @@
 !.env.example
 *.key
 *.pem
+# Приватные ключи SSH: репозиторий публичный, и одного `git add .` хватило бы,
+# чтобы ключ уехал наружу.
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
 .claude/settings.local.json
 
 # --- Данные заказчика (НЕ коммитим: коммерческая информация и вес) ---
@@ -27,6 +33,8 @@ data/kb/
 data/raw/
 data/*.sqlite3
 data/orders.jsonl
+# Спецификации заказов в Excel: контакты покупателей и коммерческие условия.
+data/orders/
 data/dialogs/
 secrets/
 

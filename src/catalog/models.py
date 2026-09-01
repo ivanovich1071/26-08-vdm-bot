@@ -39,6 +39,32 @@ class NormRef:
         )
 
 
+# Корневые разделы каталога заказчика и то, кому они адресованы. «Оснащение
+# новостроек» отнесено к садам не на глаз: все 1 048 позиций этой ветки привязаны
+# к приказу № 1057. «Коррекционная среда» и «Инновационные решения» смешанные,
+# поэтому их здесь нет — они не поднимаются и не опускаются.
+_AUDIENCE_BY_ROOT = {
+    "ОБОРУДОВАНИЕ ДЛЯ ДЕТСКОГО САДА": "preschool",
+    "ОСНАЩЕНИЕ НОВОСТРОЕК": "preschool",
+    "ОБОРУДОВАНИЕ ДЛЯ ШКОЛЫ ПО ПРИКАЗУ № 838": "school",
+}
+
+
+def _relevance(ref: NormRef, query: str) -> tuple[int, int, float]:
+    """Насколько пункт отвечает на заданный вопрос.
+
+    Порядок ключей: сначала есть ли вообще номер пункта, потом совпадение слов
+    названия пункта со словами запроса, и только затем надёжность привязки.
+    """
+    overlap = 0
+    if query and ref.item_title:
+        from catalog.text import stems
+
+        words = set(stems(query))
+        overlap = len(words & set(stems(ref.item_title)))
+    return (ref.item_code is not None, overlap, ref.confidence)
+
+
 @dataclass(frozen=True)
 class Product:
     sku_1c: str
@@ -71,11 +97,52 @@ class Product:
     def norm_codes(self) -> list[str]:
         return [ref.item_code for ref in self.norms if ref.item_code]
 
-    def best_norm(self) -> NormRef | None:
-        """Основание, которое стоит назвать в ответе: с пунктом и максимально надёжное."""
-        if not self.norms:
+    @property
+    def audiences(self) -> set[str]:
+        """Кому товар предназначен — по веткам каталога, в которых он лежит.
+
+        Товар часто лежит сразу в нескольких: садовский комплект попадает и в
+        школьный раздел. Поэтому это множество, а не одно значение.
+        """
+        found: set[str] = set()
+        for root in self.roots:
+            audience = _AUDIENCE_BY_ROOT.get(root.strip().upper())
+            if audience:
+                found.add(audience)
+        return found
+
+    def norms_for(self, audience: str | None = None) -> list[NormRef]:
+        """Основания, уместные этому собеседнику.
+
+        Сайт заказчика кладёт один товар в несколько веток сразу: садовские
+        карточки по лексическим темам стоят ещё и в школьном разделе «по приказу
+        № 838». Раньше это приводило к тому, что на вопрос про детский сад бот
+        цитировал школьный приказ.
+
+        Чужой перечень не подменяется своим и не добирается «хоть какой-нибудь»:
+        школьный пункт не является основанием для детского сада, и честнее не
+        назвать основание вовсе, чем назвать чужое.
+        """
+        from norms import documents as docs
+
+        allowed = docs.for_audience(audience)
+        return [ref for ref in self.norms if ref.doc_id in allowed]
+
+    def norm_for(self, audience: str | None = None, query: str = "") -> NormRef | None:
+        """Одно основание для строки выдачи.
+
+        У товара их бывает несколько — «КМО 2024 Классификация» закрывает и
+        пункт 2.4.35, и 4.4.17. Показываем тот, что ближе к запросу: спросили про
+        логопеда — назовём логопедический пункт, а не пункт про аутизм.
+        """
+        candidates = self.norms_for(audience)
+        if not candidates:
             return None
-        return max(self.norms, key=lambda ref: (ref.item_code is not None, ref.confidence))
+        return max(candidates, key=lambda ref: _relevance(ref, query))
+
+    def best_norm(self) -> NormRef | None:
+        """Основание без учёта собеседника. Остаётся для мест, где его негде взять."""
+        return self.norm_for(None)
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Product:

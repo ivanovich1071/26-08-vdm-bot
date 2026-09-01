@@ -93,6 +93,86 @@ class JsonlSink:
 
 
 @dataclass
+class XlsxSink:
+    """Спецификация заказа отдельным файлом Excel.
+
+    Интеграции с 1С пока нет: ни выгрузки, ни доступа заказчик не передал. Но
+    менеджеру заказ нужен уже сейчас и в том виде, в каком его заводят руками, —
+    строка на позицию, с кодом 1С, количеством, суммой и пунктом перечня. Такой
+    файл открывается и в 1С, и в закупочных системах, и годится как основа
+    спецификации к контракту.
+
+    Пишется без внешних зависимостей: xlsx — это zip с несколькими xml, а тянуть
+    ради одной таблицы openpyxl в прототип незачем.
+    """
+
+    directory: Path = Path("data/orders")
+    name: str = "xlsx"
+
+    def push(self, order: Order) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        target = self.directory / f"{order.id}.xlsx"
+        _write_xlsx(target, HEADERS, order_rows(order))
+
+
+def _write_xlsx(path: Path, headers: list[str], rows: list[list[str]]) -> None:
+    import zipfile
+    from xml.sax.saxutils import escape
+
+    def cell(value: object) -> str:
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            return f"<c t=\"n\"><v>{value}</v></c>"
+        text = escape(str(value if value is not None else ""))
+        return f'<c t="inlineStr"><is><t xml:space="preserve">{text}</t></is></c>'
+
+    body = "".join(
+        "<row>" + "".join(cell(value) for value in row) + "</row>"
+        for row in [headers, *rows]
+    )
+    sheet = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f"<sheetData>{body}</sheetData></worksheet>"
+    )
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+        ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets><sheet name="Спецификация" sheetId="1" r:id="rId1"/></sheets></workbook>'
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        "</Types>"
+    )
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Target="xl/workbook.xml"'
+        ' Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"/>'
+        "</Relationships>"
+    )
+    book_rels = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Target="worksheets/sheet1.xml"'
+        ' Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"/>'
+        "</Relationships>"
+    )
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as book:
+        book.writestr("[Content_Types].xml", content_types)
+        book.writestr("_rels/.rels", root_rels)
+        book.writestr("xl/workbook.xml", workbook)
+        book.writestr("xl/_rels/workbook.xml.rels", book_rels)
+        book.writestr("xl/worksheets/sheet1.xml", sheet)
+
+
+@dataclass
 class GoogleSheetsSink:
     """Таблица заказов вместо CRM.
 

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 
 from agent.client import ChatClient, LLMError
@@ -40,6 +41,16 @@ log = logging.getLogger(__name__)
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 MAX_TOOL_ROUNDS = 4
 HISTORY_LIMIT = 12
+# Сколько карточек прикладываем к ответу модели. Заказчик отдельно попросил
+# не больше трёх: пять карточек подряд читаются как выгрузка, а не как подбор.
+CARDS_SHOWN = 3
+
+# Код 1С в ответе модели: она обязана его называть, чтобы карточки сошлись с
+# текстом, а перед показом человеку код вырезается — он служебный.
+_CODE_MENTION = re.compile(
+    r"\s*[(\[]?\s*(?:код\s*1\s*[СCc]|артикул)\s*:?\s*[A-Za-z0-9А-ЯЁа-яё\-]+\s*[)\]]?",
+    re.IGNORECASE,
+)
 
 # Порядок склейки промптов: сначала маршрутизация веток, потом роли, в конце —
 # границы. Так правила защиты не тонут в середине длинного текста.
@@ -89,6 +100,33 @@ class SalesAgent:
         session.profile.remember_offered(_unique(tools.shown_skus))
         return self._render(session, tools, answer, text)
 
+    # --- Сведение текста ответа с карточками ---------------------------------
+
+    def _mentioned_skus(self, tools: ToolBox, answer: str) -> list[str]:
+        """Товары, которые модель действительно назвала в ответе.
+
+        Раньше искались только коды 1С. Модель их не пишет — она пишет названия, —
+        и совпадений не было ни разу, а на их месте молча подставлялись первые
+        позиции из поиска. Так и вышло, что текст обещал интерактивное зеркало и
+        песочницу, а карточками приходили парта логопеда и карточки «Овощи».
+
+        Теперь совпадение ищется двумя способами: по коду, если модель его всё же
+        назвала, и по названию. Если не нашлось ничего — карточек не будет:
+        показать наугад хуже, чем не показать.
+        """
+        by_code = [sku for sku in tools.shown_skus if sku in answer]
+        if by_code:
+            return _unique(by_code)
+
+        words = _significant(answer)
+        pairs = {(words[i], words[i + 1]) for i in range(len(words) - 1)}
+        matched = []
+        for sku in _unique(tools.shown_skus):
+            product = self.engine.index.get(sku)
+            if product is not None and _named_in(product.name, words, pairs):
+                matched.append(sku)
+        return matched
+
     # --- Цикл вызова инструментов -------------------------------------------
 
     def _ask(self, messages: list[dict], tools: ToolBox) -> str:
@@ -113,6 +151,7 @@ class SalesAgent:
     def _run(self, client: ChatClient, messages: list[dict], tools: ToolBox) -> str:
         for _ in range(MAX_TOOL_ROUNDS):
             message = client.complete(messages, tools=TOOL_SCHEMAS)
+            _account(tools.session, client, message)
             calls = message.get("tool_calls") or []
             if not calls:
                 return (message.get("content") or "").strip()
@@ -137,7 +176,9 @@ class SalesAgent:
                 "content": "Ответь пользователю по уже собранным данным, без новых вызовов.",
             }
         )
-        return (client.complete(messages).get("content") or "").strip()
+        final = client.complete(messages)
+        _account(tools.session, client, final)
+        return (final.get("content") or "").strip()
 
     # --- Проверка ответа -------------------------------------------------------
 
@@ -188,20 +229,22 @@ class SalesAgent:
     def _render(  # noqa: ANN001
         self, session, tools: ToolBox, answer: str, question: str
     ) -> list[Response]:
-        responses: list[Response] = []
-        if answer:
-            responses.append(Message(answer, keyboard=self._keyboard(tools)))
-
         # Карточки показываем по товарам, которые агент действительно назвал: так
         # текст ответа и карточки не расходятся.
-        mentioned = _unique(sku for sku in tools.shown_skus if sku in answer) or _unique(
-            tools.shown_skus
-        )
-        for sku in mentioned[:3]:
+        mentioned = self._mentioned_skus(tools, answer)
+
+        responses: list[Response] = []
+        if answer:
+            # Коды 1С нужны нам для сведения текста с карточками, но человеку в
+            # ответе они ни к чему — это внутренний артикул, а не характеристика.
+            responses.append(Message(_without_codes(answer), keyboard=self._keyboard(tools)))
+
+        audience = session.profile.audience
+        for sku in mentioned[:CARDS_SHOWN]:
             product = self.engine.index.get(sku)
             if product is None:
                 continue
-            norm = product.best_norm()
+            norm = product.norm_for(audience, session.profile.room or "")
             responses.append(
                 ProductCard(
                     product=product,
@@ -210,6 +253,10 @@ class SalesAgent:
                         Button("В корзину", f"add:{sku}"),
                         Button("Подробнее", f"card:{sku}"),
                     ),
+                    # Без этих полей карточки от модели приходили без снимка в
+                    # обоих каналах, даже когда файл лежал у нас на диске.
+                    image=self.engine._image(product),
+                    image_path=self.engine.photo_path(product),
                 )
             )
 
@@ -270,13 +317,42 @@ class SalesAgent:
         return history
 
 
+def _account(session, client: ChatClient, message: dict) -> None:  # noqa: ANN001
+    """Складывает расход модели за ход в сессию.
+
+    Ход почти никогда не равен одному обращению: сначала вызовы инструментов,
+    потом ответ, иногда ещё и переписывание из-за выдуманной цены. Стоимость
+    сценария — это сумма всех, поэтому считаем накопительно.
+    """
+    usage = message.get("_usage")
+    if not usage:
+        return
+    tokens_in = int(usage.get("tokens_in") or 0)
+    tokens_out = int(usage.get("tokens_out") or 0)
+    cost = (tokens_in * client.price_in + tokens_out * client.price_out) / 1_000_000
+
+    box = session.usage
+    box["provider"] = client.name
+    box["model"] = usage.get("model") or client.model
+    box["calls"] = int(box.get("calls", 0)) + 1
+    box["tokens_in"] = int(box.get("tokens_in", 0)) + tokens_in
+    box["tokens_out"] = int(box.get("tokens_out", 0)) + tokens_out
+    box["cost_rub"] = round(float(box.get("cost_rub", 0.0)) + cost, 4)
+
+
 def _assistant_message(message: dict) -> dict:
     """Ответ модели в том виде, в каком его примут обратно.
 
     Провайдеры расходятся в служебных полях, поэтому ничего не выбрасываем и
     ничего не придумываем: берём пришедшее и добавляем только то, чего нет.
+    Наши собственные пометки (они начинаются с подчёркивания) провайдеру,
+    разумеется, не возвращаем — он их не поймёт.
     """
-    kept = {key: value for key, value in message.items() if value is not None}
+    kept = {
+        key: value
+        for key, value in message.items()
+        if value is not None and not key.startswith("_")
+    }
     kept.setdefault("role", "assistant")
     kept.setdefault("content", "")
     kept.setdefault("reasoning_content", "")
@@ -300,3 +376,30 @@ def _unique(items) -> list[str]:  # noqa: ANN001
         if item not in seen:
             seen.append(item)
     return seen
+
+
+def _significant(text: str) -> list[str]:
+    """Основы слов длиннее двух букв — по ним сверяются названия товаров."""
+    from catalog.text import stems
+
+    return [word for word in stems(text) if len(word) > 2 and not word.isdigit()]
+
+
+def _named_in(name: str, words: list[str], pairs: set[tuple[str, str]]) -> bool:
+    """Названо ли это в ответе.
+
+    Названия у заказчика начинаются с кода поставщика — «ВТ ПЛ Парта логопеда», —
+    а модель пишет «парта логопеда». Поэтому сверяются не строки, а пары соседних
+    значимых слов: одно общее слово («набор», «комплект») есть у половины каталога
+    и совпадением не является.
+    """
+    own = _significant(name)
+    if not own:
+        return False
+    if len(own) == 1:
+        return own[0] in words
+    return any((own[i], own[i + 1]) in pairs for i in range(len(own) - 1))
+
+
+def _without_codes(answer: str) -> str:
+    return _CODE_MENTION.sub("", answer)

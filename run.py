@@ -30,6 +30,10 @@ def main() -> None:
     norms.add_argument("--show-unmatched", type=int, default=10,
                        help="сколько ненайденных кодов показать")
 
+    acts = sub.add_parser("acts", help="разобрать тексты приказов 838 и 1057 в справочник пунктов")
+    acts.add_argument("--check", action="store_true",
+                      help="сверить пункты базы знаний с текстами приказов")
+
     sub.add_parser("widget", help="поднять веб-виджет и демо-страницу")
     sub.add_parser("telegram", help="запустить Telegram-бота")
     sub.add_parser("llm", help="проверить провайдеров модели по шагам")
@@ -50,6 +54,8 @@ def main() -> None:
                        help="только перелить накопленное в базу знаний, без обращений к сайту")
     media.add_argument("--no-files", action="store_true",
                        help="не скачивать файлы снимков, собрать только адреса")
+    media.add_argument("--dedupe", action="store_true",
+                       help="убрать одинаковые снимки внутри папки одного товара")
 
     dialogs = sub.add_parser("dialogs", help="показать записанные диалоги")
     dialogs.add_argument("--last", type=int, default=10, help="сколько последних диалогов")
@@ -88,6 +94,9 @@ def main() -> None:
                 print(f"    … ещё {len(report.unmatched) - args.show_unmatched}")
         print(f"\nреестр сохранён: {DEFAULT_REGISTRY}")
         print("Дальше: python run.py ingest --source <выгрузка>.xlsx")
+
+    elif args.command == "acts":
+        _parse_acts(args)
 
     elif args.command == "widget":
         from web.app import main as run_widget
@@ -147,6 +156,53 @@ def main() -> None:
                 print(f"    {hit.citation()}")
 
 
+def _parse_acts(args) -> None:  # noqa: ANN001 — argparse.Namespace
+    """Справочник пунктов из текстов приказов и сверка с ним базы знаний.
+
+    Сами PDF в репозитории не лежат — как и любые документы заказчика, — поэтому
+    команду запускает тот, у кого файлы рядом с проектом. Без справочника бот
+    работает по-прежнему, называя номер пункта без формулировки.
+    """
+    from catalog.repository import load_products
+    from norms import documents as docs
+    from norms import items as norm_items
+
+    sources = {
+        doc.id: Path(doc.pdf_name)
+        for doc in docs.DOCUMENTS.values()
+        if doc.pdf_name
+    }
+    missing = [str(path) for path in sources.values() if not path.exists()]
+    if missing:
+        print("Не найдены файлы приказов рядом с проектом:")
+        for name in missing:
+            print("   ", name)
+        if len(missing) == len(sources):
+            return
+
+    counts = norm_items.build(sources)
+    for doc_id, count in counts.items():
+        print(f"{docs.get(doc_id).short_name}: разобрано пунктов — {count}")
+    print(f"справочник сохранён: {norm_items.DEFAULT_ITEMS}")
+
+    if not args.check:
+        return
+
+    known = norm_items.load()
+    ours: dict[tuple[str, str], str] = {}
+    for product in load_products():
+        for ref in product.norms:
+            if ref.item_code:
+                ours.setdefault((ref.doc_id, ref.item_code), product.name)
+
+    missing_codes = [key for key in ours if key[1] not in known.get(key[0], {})]
+    print(f"\nпунктов в базе знаний: {len(ours)} · не нашлось в приказах: {len(missing_codes)}")
+    for doc_id, code in sorted(missing_codes)[:20]:
+        print(f"    {docs.get(doc_id).short_name} п. {code} — {ours[(doc_id, code)][:50]}")
+    if len(missing_codes) > 20:
+        print(f"    … ещё {len(missing_codes) - 20}")
+
+
 def _collect_media(args) -> None:  # noqa: ANN001 — argparse.Namespace
     """Сбор фотографий и характеристик с сайта и запись их в базу знаний.
 
@@ -163,6 +219,16 @@ def _collect_media(args) -> None:  # noqa: ANN001 — argparse.Namespace
 
     settings = Settings.from_env()
     engine = build_engine(settings)
+
+    if args.dedupe:
+        from media.files import drop_duplicates
+
+        removed = drop_duplicates(settings.media_dir)
+        print(f"удалено одинаковых снимков внутри папок товаров: {len(removed)}")
+        for name in removed[:20]:
+            print("   ", name)
+        print("перелито в базу знаний:", sync_to_kb(engine.storage, settings.kb_path))
+        return
 
     if args.sync:
         print("Перелито в базу знаний:", sync_to_kb(engine.storage, settings.kb_path))

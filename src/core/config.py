@@ -43,6 +43,13 @@ class Settings:
     openrouter_model: str = "qwen/qwen3-235b-a22b-2507"
     llm_timeout_seconds: float = 60.0
     llm_max_tokens: int = 1200
+    # Рубли за миллион токенов — по прайсу провайдера на 01.09.2026. Нужны,
+    # чтобы в журнале стояла стоимость хода: выбирать модель по цифрам дешевле,
+    # чем по впечатлению. Цены меняются, поэтому это настройка, а не константа.
+    cloudru_price_in: float = 18.53
+    cloudru_price_out: float = 37.08
+    openrouter_price_in: float = 0.0
+    openrouter_price_out: float = 0.0
 
     # Каналы
     telegram_token: str = ""
@@ -55,6 +62,9 @@ class Settings:
     google_sheets_id: str = ""
     google_credentials_file: str = "secrets/google-service-account.json"
     orders_jsonl_path: str = "data/orders.jsonl"
+    # Куда кладётся спецификация заказа в Excel — то, что менеджер заводит в 1С
+    # руками, пока интеграции нет.
+    orders_xlsx_dir: str = "data/orders"
 
     # Фотографии товаров с сайта заказчика.
     # Сайт принадлежит заказчику, бот делается для него же, поэтому сбор включён.
@@ -97,6 +107,10 @@ class Settings:
             openrouter_model=env.get("OPENROUTER_MODEL", cls.openrouter_model),
             llm_timeout_seconds=float(env.get("LLM_TIMEOUT_SECONDS", cls.llm_timeout_seconds)),
             llm_max_tokens=int(env.get("LLM_MAX_TOKENS", cls.llm_max_tokens)),
+            cloudru_price_in=float(env.get("CLOUDRU_PRICE_IN", cls.cloudru_price_in)),
+            cloudru_price_out=float(env.get("CLOUDRU_PRICE_OUT", cls.cloudru_price_out)),
+            openrouter_price_in=float(env.get("OPENROUTER_PRICE_IN", cls.openrouter_price_in)),
+            openrouter_price_out=float(env.get("OPENROUTER_PRICE_OUT", cls.openrouter_price_out)),
             telegram_token=env.get("TELEGRAM_TOKEN", ""),
             max_token=env.get("MAX_TOKEN", ""),
             site_url=env.get("SITE_URL", cls.site_url),
@@ -107,6 +121,7 @@ class Settings:
                 "GOOGLE_CREDENTIALS_FILE", cls.google_credentials_file
             ),
             orders_jsonl_path=env.get("ORDERS_JSONL_PATH", cls.orders_jsonl_path),
+            orders_xlsx_dir=env.get("ORDERS_XLSX_DIR", cls.orders_xlsx_dir),
             media_enabled=env.get("MEDIA_ENABLED", "1") not in {"0", "false", "no"},
             media_dir=env.get("MEDIA_DIR", cls.media_dir),
             media_min_interval=float(env.get("MEDIA_MIN_INTERVAL", cls.media_min_interval)),

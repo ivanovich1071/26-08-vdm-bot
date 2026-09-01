@@ -51,6 +51,22 @@ _ROOMS: tuple[tuple[str, str], ...] = (
     ("игровая площадка", r"\bплощадк\w+|улич\w+\s+оборудован\w*"),
 )
 
+# Кому подбираем — по типу учреждения и по кабинету. Нужно, чтобы бот не
+# обосновывал садовскую позицию школьным приказом и наоборот.
+_AUDIENCE_BY_INSTITUTION = {
+    "детский сад": "preschool",
+    "центр развития": "preschool",
+    "школа": "school",
+    "колледж": "school",
+}
+_AUDIENCE_BY_ROOM = {
+    "групповая комната": "preschool",
+    "кабинет физики": "school",
+    "кабинет химии": "school",
+    "кабинет биологии": "school",
+    "кабинет технологии": "school",
+}
+
 _AGE_RANGE = re.compile(r"\b(\d)\s*[-–—]\s*(\d{1,2})\s*лет", re.IGNORECASE)
 _AGE_GROUPS: tuple[tuple[str, str], ...] = (
     ("младшая группа", r"младш\w+\s+групп\w*|ясельн\w+"),
@@ -98,6 +114,29 @@ class DialogProfile:
     # бот не предлагал по кругу одно и то же.
     offered: list[str] = field(default_factory=list)
     rejected: list[str] = field(default_factory=list)
+
+    @property
+    def audience(self) -> str | None:
+        """Кому подбираем: `preschool`, `school` или ничего, пока не ясно.
+
+        От этого зависит, каким перечнем бот вправе обосновывать позицию. Один и
+        тот же товар лежит у заказчика и в садовской, и в школьной ветке каталога,
+        поэтому без аудитории бот цитировал школьный приказ человеку из детского сада.
+
+        Порядок источников — от самого надёжного: прямо названный документ, потом
+        тип учреждения, и только затем кабинет. Кабинет физики бывает и в школе,
+        и в колледже, а вот групповая комната — только в саду.
+        """
+        for doc_id in self.norm_doc_ids:
+            if doc_id == "order_838":
+                return "school"
+            if doc_id in {"order_1057", "fgos_do", "fop_do", "func_kits"}:
+                return "preschool"
+        if self.institution:
+            return _AUDIENCE_BY_INSTITUTION.get(self.institution)
+        if self.room:
+            return _AUDIENCE_BY_ROOM.get(self.room)
+        return None
 
     @property
     def is_empty(self) -> bool:
