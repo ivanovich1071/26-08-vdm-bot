@@ -8,7 +8,7 @@
 
 import json
 
-from agent.agent import _account, _assistant_message
+from agent.agent import _assistant_message, account_usage
 from agent.client import ChatClient
 from core.dialog import Session
 from observability.dialog_log import DialogLogger
@@ -35,7 +35,7 @@ def message(tokens_in, tokens_out, content="ответ"):
 
 def test_cost_is_counted_in_rubles():
     session = Session(user_id="u1", channel="telegram")
-    _account(session, client(), message(1_000_000, 1_000_000))
+    account_usage(session, client(), message(1_000_000, 1_000_000))
     assert session.usage["cost_rub"] == 55.61
     assert session.usage["provider"] == "cloudru"
 
@@ -44,7 +44,7 @@ def test_turn_sums_every_call_to_the_model():
     """Один ход — несколько обращений: инструменты, потом ответ."""
     session = Session(user_id="u1", channel="telegram")
     for _ in range(3):
-        _account(session, client(), message(1000, 200))
+        account_usage(session, client(), message(1000, 200))
 
     assert session.usage["calls"] == 3
     assert session.usage["tokens_in"] == 3000
@@ -53,7 +53,7 @@ def test_turn_sums_every_call_to_the_model():
 
 def test_answer_without_usage_does_not_break_accounting():
     session = Session(user_id="u1", channel="telegram")
-    _account(session, client(), {"role": "assistant", "content": "без расхода"})
+    account_usage(session, client(), {"role": "assistant", "content": "без расхода"})
     assert session.usage == {}
 
 

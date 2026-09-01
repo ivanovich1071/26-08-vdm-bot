@@ -345,7 +345,7 @@ def _format_dialogs(sessions: dict, channel: str | None) -> list[str]:
         lines += ["", head, ""]
         for turn in turns:
             marker = "→" if turn["kind"] == "text" else "⌨"
-            lines.append(f"{marker} {turn['in']}   [{turn['mode']}, {turn['latency_ms']} мс]")
+            lines.append(f"{marker} {turn['in']}   [{_marks(turn)}]")
             for out in turn["out"]:
                 if out["type"] == "text":
                     lines.append(f"   бот: {out['text']}")
@@ -359,7 +359,57 @@ def _format_dialogs(sessions: dict, channel: str | None) -> list[str]:
                 elif out["type"] == "order":
                     lines.append(f"   бот: заказ на {out['total']} ₽, позиций {out['positions']}")
             lines.append("")
+        lines += _totals(turns) + [""]
     return lines
+
+
+# --- Разметка прогона ---------------------------------------------------------
+#
+# Ручные прогоны по сценариям с возражениями заказчик делает сам, под ВПН, и
+# разбирать их приходится по стенограмме. Поэтому в неё идёт не только текст, но
+# и то, чем ход обошёлся и почему бот повёл себя именно так.
+
+_ROLE_NAMES = {"consult": "консультант", "sell": "продавец", "guard": "защита"}
+
+
+def _marks(turn: dict) -> str:
+    """Пометки хода: роль, этап, стоимость, причина по карточкам."""
+    parts = [turn["mode"], f"{turn['latency_ms']} мс"]
+    route = turn.get("route") or {}
+    if route:
+        parts.append(_ROLE_NAMES.get(str(route.get("role")), str(route.get("role"))))
+        if route.get("stage"):
+            parts.append(str(route["stage"]))
+        if route.get("objection") and route["objection"] != "none":
+            snag = str(route["objection"])
+            parts.append(f"возражение {snag}" + ("" if route.get("objection_handled") else " ✗"))
+        cards = route.get("cards") or {}
+        if cards:
+            parts.append(("карточки: да" if cards.get("allowed") else "карточек нет") + f" — {cards.get('reason', '')}")
+    usage = turn.get("usage") or {}
+    if usage:
+        parts.append(
+            f"{usage.get('tokens_in', 0)}+{usage.get('tokens_out', 0)} токенов, "
+            f"{usage.get('cost_rub', 0)} ₽"
+        )
+    return ", ".join(parts)
+
+
+def _totals(turns: list[dict]) -> list[str]:
+    """Итог прогона: ходы, обращения к модели, токены, рубли."""
+    calls = tokens_in = tokens_out = 0
+    cost = 0.0
+    for turn in turns:
+        usage = turn.get("usage") or {}
+        calls += int(usage.get("calls") or 0)
+        tokens_in += int(usage.get("tokens_in") or 0)
+        tokens_out += int(usage.get("tokens_out") or 0)
+        cost += float(usage.get("cost_rub") or 0.0)
+    return [
+        f"**Итог прогона:** ходов {len(turns)}, обращений к модели {calls}, "
+        f"токенов {tokens_in} на входе и {tokens_out} на выходе, "
+        f"стоимость {round(cost, 3)} ₽."
+    ]
 
 
 if __name__ == "__main__":

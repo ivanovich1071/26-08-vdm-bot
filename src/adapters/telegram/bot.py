@@ -20,6 +20,8 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
 )
 from aiogram.types import (
     Message as TgMessage,
@@ -126,6 +128,21 @@ COMMANDS: tuple[tuple[str, str], ...] = (
     ("manager", "связаться с менеджером"),
 )
 
+# Постоянная клавиатура под полем ввода. Сам список команд Telegram рисует только
+# столбцом — это UI клиента, раскладку задать нечем. Строку кнопок даёт вот эта
+# клавиатура: три частых действия всегда под рукой, остальное остаётся в «Меню».
+# Нажатие приходит обычным текстом, разбирает его ядро (`dialog.KEYBOARD_ACTIONS`).
+PERSISTENT_BUTTONS: tuple[str, ...] = ("Каталог", "Моя корзина", "Менеджер")
+
+
+def persistent_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=title) for title in PERSISTENT_BUTTONS]],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Напишите, что нужно подобрать",
+    )
+
 
 def render_card(card: ProductCard) -> str:
     """Карточка так же полно, как на странице сайта.
@@ -216,9 +233,17 @@ async def send(
     responses: list[Response],
     storage=None,  # noqa: ANN001
     origin: TgMessage | None = None,
+    persistent: bool = False,
 ) -> None:
     for response in responses:
         markup = to_markup(getattr(response, "keyboard", None))
+
+        # Постоянную клавиатуру Telegram принимает только вместо инлайн-кнопок и
+        # только один раз: дальше она держится сама, под какими бы сообщениями ни
+        # приходили инлайн-кнопки. Ставим её на приветствие и больше не трогаем.
+        if persistent and isinstance(response, Message):
+            markup = persistent_keyboard()
+            persistent = False
 
         # Изменение количества правит то сообщение, под которым нажали кнопку.
         # Раньше каждое «+» присылало новую копию корзины, изменений в ней было
@@ -358,7 +383,15 @@ def build_dispatcher(engine: DialogEngine) -> Dispatcher:
         # Команды разбирает ядро: /start одинаково начинает разговор заново и в
         # Telegram, и в виджете, и правило это должно жить в одном месте.
         user, chat, text = str(message.from_user.id), message.chat.id, message.text
-        await _reply(bot, chat, engine, lambda: engine.handle_text(user, CHANNEL, text))
+        await _reply(
+            bot,
+            chat,
+            engine,
+            lambda: engine.handle_text(user, CHANNEL, text),
+            # Строка кнопок ставится на приветствие: /start человек зовёт и в
+            # начале разговора, и когда хочет начать заново.
+            persistent=text.strip().lower().startswith("/start"),
+        )
 
     @dispatcher.callback_query(F.data)
     async def on_callback(query: CallbackQuery, bot: Bot) -> None:
@@ -370,6 +403,9 @@ def build_dispatcher(engine: DialogEngine) -> Dispatcher:
             engine,
             lambda: engine.handle_action(user, CHANNEL, data),
             origin=query.message,
+            # «Начать заново» кнопкой возвращает то же приветствие, что и /start,
+            # — и строку кнопок вместе с ним.
+            persistent=data == "restart_yes",
         )
 
     return dispatcher
@@ -381,6 +417,7 @@ async def _reply(  # noqa: ANN001
     engine: DialogEngine,
     work,
     origin: TgMessage | None = None,
+    persistent: bool = False,
 ) -> None:
     """Ответ на сообщение: считаем в отдельном потоке, показываем «печатает».
 
@@ -409,7 +446,7 @@ async def _reply(  # noqa: ANN001
         return
 
     try:
-        await send(bot, chat_id, responses, engine.storage, origin)
+        await send(bot, chat_id, responses, engine.storage, origin, persistent=persistent)
     except TelegramNetworkError as exc:
         # Ответ уже посчитан, но связь оборвалась. Молчим в чат и остаёмся живыми:
         # опрос продолжится, а человек повторит вопрос.

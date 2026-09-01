@@ -99,6 +99,16 @@ _REJECTION = re.compile(
 )
 
 
+# Человеческие названия возражений — для строки «незакрытое возражение» в промпте.
+_OBJECTION_NAMES = {
+    "price": "цена",
+    "norm": "сомнение в нормативном основании",
+    "trust": "недоверие к боту или к поставщику",
+    "logistics": "сроки, доставка, наличие",
+    "docs": "документы для закупки",
+}
+
+
 @dataclass
 class DialogProfile:
     """Всё, что бот выяснил о задаче. Ни одного поля о человеке."""
@@ -114,6 +124,19 @@ class DialogProfile:
     # бот не предлагал по кругу одно и то же.
     offered: list[str] = field(default_factory=list)
     rejected: list[str] = field(default_factory=list)
+
+    # --- Ход разговора ---------------------------------------------------------
+    #
+    # Заполняет маршрутизатор (`agent/routing.py`) перед каждым ответом. Здесь
+    # это живёт, а не в агенте, потому что от этих полей зависит гейт карточек, а
+    # он должен переживать перезапуск: иначе после рестарта бот снова вываливает
+    # позиции человеку, который только что сказал «дорого».
+    stage: str = "diagnosis"  # diagnosis | presentation | objection | closing
+    objection: str = "none"  # price | norm | trust | logistics | docs | none
+    objection_handled: bool = False
+    # Клиент готов смотреть позиции: прямо попросил показать либо согласился
+    # после снятия возражения.
+    ready_to_see: bool = False
 
     @property
     def audience(self) -> str | None:
@@ -137,6 +160,32 @@ class DialogProfile:
         if self.room:
             return _AUDIENCE_BY_ROOM.get(self.room)
         return None
+
+    @property
+    def task_known(self) -> bool:
+        """Достаточно ли выяснено, чтобы показывать позиции.
+
+        Минимум — учреждение и зона: без них подбор идёт наугад, а основание
+        берётся из чужого перечня. Полный набор (возраст, бюджет, срок) точнее,
+        но ждать его до первой карточки нельзя: заведующая из первого сценария
+        на третьем вопросе подряд отвечает «у меня нет времени заполнять анкету».
+        """
+        return bool(self.institution and self.room)
+
+    @property
+    def facts_known(self) -> int:
+        """Сколько полей гейта заполнено — для журнала и отладки."""
+        return sum(
+            1
+            for value in (
+                self.institution,
+                self.room,
+                self.age,
+                self.budget,
+                self.deadline,
+            )
+            if value
+        )
 
     @property
     def is_empty(self) -> bool:
@@ -243,6 +292,8 @@ class DialogProfile:
             lines.append(
                 f"- Отклонено пользователем, повторно не предлагать: {len(self.rejected)}"
             )
+        if self.objection != "none" and not self.objection_handled:
+            lines.append(f"- Незакрытое возражение: {_OBJECTION_NAMES.get(self.objection, self.objection)}")
         lines += ["", "Это уже сказано пользователем. Переспрашивать перечисленное запрещено."]
         return "\n".join(lines)
 
@@ -257,6 +308,10 @@ class DialogProfile:
             "region": self.region,
             "offered": self.offered,
             "rejected": self.rejected,
+            "stage": self.stage,
+            "objection": self.objection,
+            "objection_handled": self.objection_handled,
+            "ready_to_see": self.ready_to_see,
         }
 
     @classmethod

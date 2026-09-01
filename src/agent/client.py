@@ -58,12 +58,15 @@ class ChatClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.3,
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": self.max_tokens,
+            # Маршрутизатору нужен короткий JSON, а не полторы тысячи токенов:
+            # предел задаётся вызовом, иначе за него платим впустую.
+            "max_tokens": max_tokens or self.max_tokens,
         }
         if tools:
             payload["tools"] = tools

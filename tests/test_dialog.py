@@ -71,8 +71,8 @@ def test_start_greets_with_menu(engine):
 
 def test_search_returns_list_with_citation(engine):
     responses = engine.handle_text(USER, CHANNEL, "2.20.63")
-    assert isinstance(responses[0], ProductList)
-    assert responses[0].cards[0].citation.startswith("позиция 2.20.63")
+    listing = [r for r in responses if isinstance(r, ProductList)][0]
+    assert listing.cards[0].citation.startswith("позиция 2.20.63")
 
 
 def test_add_and_quantity_changes_persist(engine):
@@ -172,7 +172,7 @@ def test_unknown_command_does_not_crash(engine):
 )
 def test_result_title_uses_correct_plural(engine, query, expected):
     """Регрессия: заголовок выдачи писал «1 позиций»."""
-    responses = engine.handle_text(USER, CHANNEL, query)
+    responses = engine.search(engine.session(USER, CHANNEL), query)
     assert expected in responses[0].title
 
 
@@ -241,7 +241,7 @@ def test_request_for_goods_by_norm_is_still_a_search(engine):
     engine.agent = None
     responses = engine.handle_text(USER, CHANNEL, "подбери оборудование по приказу 838")
 
-    assert isinstance(responses[0], ProductList)
+    assert any(isinstance(r, ProductList) for r in responses)
 
 
 def test_profile_survives_restart_of_the_process(engine, tmp_path):

@@ -59,8 +59,8 @@ def test_text_and_answer_are_recorded(engine, tmp_path):
 
     assert entry["channel"] == CHANNEL
     assert entry["in"] == "фрезерный станок"
-    assert entry["out"][0]["type"] == "list"
-    assert entry["out"][0]["items"][0]["sku"] == "S1"
+    listing = [item for item in entry["out"] if item["type"] == "list"][0]
+    assert listing["items"][0]["sku"] == "S1"
 
 
 def test_button_presses_are_recorded(engine, tmp_path):

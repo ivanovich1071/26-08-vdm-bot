@@ -1,7 +1,13 @@
-"""Агент: консультант и продажник в одном диалоге.
+"""Два агента в одном диалоге: консультант и продавец.
+
+Роль на каждый ход выбирает маршрутизатор (`agent/routing.py`), и промпт
+собирается под неё. Раньше все четыре файла промптов склеивались в одну простыню
+на четыре с лишним тысячи токенов и уходили одному вызову — агенту приходилось
+быть сразу справочной, продавцом и охраной, и он выбирал самое простое: показать
+товар. Отсюда жалоба заказчика «пропал режим диалога».
 
 Ключевое свойство — деградация без обрыва. Если провайдер не ответил, пробуем
-следующего; если легли все — диалог продолжается обычным поиском по каталогу.
+следующего; если легли все — диалог продолжается предложением из каталога.
 Бот, который молчит из-за недоступности внешнего сервиса, хуже бота без модели.
 
 Персональные данные до модели не доходят: история приходит сюда уже маскированной
@@ -32,6 +38,7 @@ from pathlib import Path
 
 from agent.client import ChatClient, LLMError
 from agent.providers import LLMRouter
+from agent.routing import CONSULT, GUARD, SELL, Decision, Router
 from agent.tools import TOOL_SCHEMAS, ToolBox
 from agent.verify import invented_prices, prices_in, talks_about_goods
 from core.ui import Button, Keyboard, Message, ProductCard, ProductList, Response
@@ -52,9 +59,21 @@ _CODE_MENTION = re.compile(
     re.IGNORECASE,
 )
 
-# Порядок склейки промптов: сначала маршрутизация веток, потом роли, в конце —
-# границы. Так правила защиты не тонут в середине длинного текста.
-PROMPT_PARTS = ("router", "consultant", "salesman", "guard")
+# Из чего собирается промпт роли. Границы идут первыми, чтобы не тонуть в
+# середине длинного текста, дальше общая часть, дальше сама роль.
+ROLE_PARTS: dict[str, tuple[str, ...]] = {
+    CONSULT: ("guard", "common", "consultant"),
+    SELL: ("guard", "common", "salesman"),
+    GUARD: ("guard",),
+}
+
+# Какие инструменты доступны роли. Консультанту каталог не нужен: он объясняет
+# документы, а не подбирает. Охране не нужно ничего.
+ROLE_TOOLS: dict[str, tuple[str, ...]] = {
+    CONSULT: ("explain_norm", "get_cart", "handoff_to_manager"),
+    SELL: (),  # пустой кортеж — значит все
+    GUARD: ("__none__",),
+}
 
 
 def load_prompt(name: str) -> str:
@@ -62,13 +81,48 @@ def load_prompt(name: str) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
+def tools_for(branch: str) -> list[dict] | None:
+    allowed = ROLE_TOOLS.get(branch, ())
+    if not allowed:
+        return TOOL_SCHEMAS
+    chosen = [
+        schema
+        for schema in TOOL_SCHEMAS
+        if schema.get("function", {}).get("name") in allowed
+    ]
+    return chosen or None
+
+
+def may_show_cards(profile, decision: Decision) -> tuple[bool, str]:  # noqa: ANN001
+    """Можно ли приложить к ответу карточки товаров — и почему.
+
+    Заказчик сформулировал правило так: «только после отработки возражений
+    выводить карточку с кнопкой подробнее или в корзину, бот должен быть живым,
+    а не просто связывать карточки и корзину». Причина решения возвращается
+    наружу и пишется в журнал — иначе на прогоне не понять, почему бот промолчал.
+    """
+    if decision.branch != SELL:
+        return False, "ветка консультирования"
+    if profile.objection != "none" and not profile.objection_handled:
+        return False, f"возражение не снято ({profile.objection})"
+    if not profile.ready_to_see:
+        return False, "клиент не просил показывать"
+    if not profile.task_known and not decision.precise:
+        return False, "не выяснены учреждение и зона"
+    return True, "задача ясна, клиент готов смотреть"
+
+
 class SalesAgent:
-    def __init__(self, engine, router: LLMRouter) -> None:  # noqa: ANN001
+    def __init__(self, engine, router: LLMRouter, routing: Router | None = None) -> None:  # noqa: ANN001
         self.engine = engine
         self.router = router
-        self.system_prompt = "\n\n".join(
-            part for part in (load_prompt(name) for name in PROMPT_PARTS) if part
-        )
+        self.routing = routing if routing is not None else Router(router)
+        self.prompts = {
+            branch: "\n\n".join(
+                part for part in (load_prompt(name) for name in names) if part
+            )
+            for branch, names in ROLE_PARTS.items()
+        }
 
     @property
     def available(self) -> bool:
@@ -76,29 +130,41 @@ class SalesAgent:
 
     def reply(self, session, text: str) -> list[Response]:  # noqa: ANN001
         if not self.available:
-            return self.engine.search(session, text)
+            return self.engine.offer(session, text)
+
+        decision = self.routing.decide(session, text)
+        show_cards, reason = may_show_cards(session.profile, decision)
+        session.route = {
+            "role": decision.branch,
+            "stage": decision.stage,
+            "objection": session.profile.objection,
+            "objection_handled": session.profile.objection_handled,
+            "routed_by": decision.source,
+            "cards": {"allowed": show_cards, "reason": reason},
+        }
 
         tools = ToolBox(self.engine, session)
         messages = [
-            {"role": "system", "content": self._system_prompt(session)},
+            {"role": "system", "content": self._system_prompt(session, decision)},
             *self._history(session),
         ]
 
         try:
-            answer = self._ask(messages, tools)
+            answer = self._ask(messages, tools, tools_for(decision.branch))
+            session.prices |= tools.prices
         except LLMError:
             # Провайдеры уже помечены нерабочими и записаны в лог — здесь остаётся
-            # только доиграть ход поиском по каталогу.
-            return self.engine.search(session, text)
+            # только доиграть ход предложением из каталога.
+            return self.engine.offer(session, text)
 
         answer = self._without_invented_prices(answer, messages, tools, text, session)
         if not answer:
-            return self.engine.search(session, text)
+            return self.engine.offer(session, text)
 
         answer = session.masker.unmask(answer)
         session.remember("assistant", answer)
         session.profile.remember_offered(_unique(tools.shown_skus))
-        return self._render(session, tools, answer, text)
+        return self._render(session, tools, answer, text, decision, show_cards)
 
     # --- Сведение текста ответа с карточками ---------------------------------
 
@@ -129,7 +195,7 @@ class SalesAgent:
 
     # --- Цикл вызова инструментов -------------------------------------------
 
-    def _ask(self, messages: list[dict], tools: ToolBox) -> str:
+    def _ask(self, messages: list[dict], tools: ToolBox, schemas: list[dict] | None) -> str:
         """Ход разговора: пробуем провайдеров по очереди, пока кто-то не ответит.
 
         Каждому даём свою копию сообщений. Цикл вызова инструментов дописывает
@@ -139,7 +205,7 @@ class SalesAgent:
         last: LLMError | None = None
         for client in self.router.ready():
             try:
-                answer = self._run(client, list(messages), tools)
+                answer = self._run(client, list(messages), tools, schemas)
             except LLMError as exc:
                 self.router.mark_down(client, exc)
                 last = exc
@@ -148,10 +214,16 @@ class SalesAgent:
             return answer
         raise last or LLMError("нет настроенных провайдеров модели")
 
-    def _run(self, client: ChatClient, messages: list[dict], tools: ToolBox) -> str:
+    def _run(
+        self,
+        client: ChatClient,
+        messages: list[dict],
+        tools: ToolBox,
+        schemas: list[dict] | None,
+    ) -> str:
         for _ in range(MAX_TOOL_ROUNDS):
-            message = client.complete(messages, tools=TOOL_SCHEMAS)
-            _account(tools.session, client, message)
+            message = client.complete(messages, tools=schemas)
+            account_usage(tools.session, client, message)
             calls = message.get("tool_calls") or []
             if not calls:
                 return (message.get("content") or "").strip()
@@ -177,7 +249,7 @@ class SalesAgent:
             }
         )
         final = client.complete(messages)
-        _account(tools.session, client, final)
+        account_usage(tools.session, client, final)
         return (final.get("content") or "").strip()
 
     # --- Проверка ответа -------------------------------------------------------
@@ -191,7 +263,16 @@ class SalesAgent:
         когда ей называют конкретные лишние числа. Если и второй ответ выдуман,
         возвращаем пустую строку — вызывающая сторона ответит выдачей каталога.
         """
-        allowed = tools.prices | prices_in(question) | prices_in(session.profile.budget or "")
+        # Цены за весь разговор, а не только за этот ход. Отвечая на «дорого»,
+        # модель ссылается на уже показанные позиции и в инструменты не ходит —
+        # проверка по одному ходу отвергала такой ответ дважды подряд и роняла
+        # его в выдачу каталога. Поймано на живом прогоне 01.09.
+        allowed = (
+            tools.prices
+            | session.prices
+            | prices_in(question)
+            | prices_in(session.profile.budget or "")
+        )
         invented = invented_prices(answer, allowed)
         if not invented:
             return answer
@@ -214,7 +295,7 @@ class SalesAgent:
             }
         )
         try:
-            second = self._ask(messages, tools)
+            second = self._ask(messages, tools, TOOL_SCHEMAS)
         except LLMError:
             return ""
 
@@ -227,11 +308,17 @@ class SalesAgent:
     # --- Сборка ответа --------------------------------------------------------
 
     def _render(  # noqa: ANN001
-        self, session, tools: ToolBox, answer: str, question: str
+        self,
+        session,
+        tools: ToolBox,
+        answer: str,
+        question: str,
+        decision: Decision,
+        show_cards: bool,
     ) -> list[Response]:
         # Карточки показываем по товарам, которые агент действительно назвал: так
         # текст ответа и карточки не расходятся.
-        mentioned = self._mentioned_skus(tools, answer)
+        mentioned = self._mentioned_skus(tools, answer) if show_cards else []
 
         responses: list[Response] = []
         if answer:
@@ -261,14 +348,25 @@ class SalesAgent:
             )
 
         if not responses:
-            # Модель промолчала — отвечаем поиском по исходному вопросу.
-            return self.engine.search(session, question)
+            # Модель промолчала — отвечаем предложением по исходному вопросу.
+            return self.engine.offer(session, question)
 
         # Модель перечислила оборудование словами, не заглянув в каталог. Спорить
         # с ней дорого — целое обращение, — поэтому просто дописываем настоящие
         # позиции: с ценой, наличием и пунктом перечня.
-        if not tools.shown_skus and talks_about_goods(answer):
-            found = self.engine.search(session, self._catalog_query(session, question))
+        #
+        # Только у продавца. У консультанта эта страховка срабатывала на любом
+        # ответе с двумя пунктами списком: человек спрашивал про приказ, получал
+        # объяснение — и под ним выдачу каталога. Именно так «пропадал диалог».
+        if show_cards and not tools.shown_skus and talks_about_goods(answer):
+            found = self.engine.search(
+                session,
+                self._catalog_query(session, question),
+                # Заголовок «Нашлось более 50 позиций по запросу…» здесь не к
+                # месту: человек не искал, он получил ответ, к которому мы сами
+                # дописываем настоящие позиции.
+                title="Вот эти позиции есть в каталоге",
+            )
             # Пустая выдача сюда не идёт: «ничего не нашёл» сразу после связного
             # ответа модели выглядит поломкой, а не помощью.
             if any(isinstance(item, ProductList) for item in found):
@@ -295,10 +393,11 @@ class SalesAgent:
         keyboard.row(Button("Корзина", "cart"), Button("Оформить", "checkout"))
         return keyboard
 
-    def _system_prompt(self, session) -> str:  # noqa: ANN001
-        """Промпт роли плюс то, что уже известно об этом разговоре."""
+    def _system_prompt(self, session, decision: Decision) -> str:  # noqa: ANN001
+        """Промпт выбранной роли плюс то, что уже известно об этом разговоре."""
+        base = self.prompts.get(decision.branch) or self.prompts[SELL]
         profile = session.profile.as_prompt()
-        return f"{self.system_prompt}\n\n{profile}" if profile else self.system_prompt
+        return f"{base}\n\n{profile}" if profile else base
 
     def _history(self, session) -> list[dict]:  # noqa: ANN001
         """Переписка для модели.
@@ -317,7 +416,7 @@ class SalesAgent:
         return history
 
 
-def _account(session, client: ChatClient, message: dict) -> None:  # noqa: ANN001
+def account_usage(session, client: ChatClient, message: dict) -> None:  # noqa: ANN001
     """Складывает расход модели за ход в сессию.
 
     Ход почти никогда не равен одному обращению: сначала вызовы инструментов,

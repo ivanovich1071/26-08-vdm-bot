@@ -169,6 +169,23 @@ def attach(engine: DialogEngine, *clients: ChatClient) -> SalesAgent:
     return agent
 
 
+def ready(engine: DialogEngine) -> None:
+    """Профиль, при котором гейт разрешает показать карточки.
+
+    Учреждение и зона — тот минимум, который заказчик согласовал: пока их нет,
+    бот разговаривает, а не выкладывает товар.
+    """
+    profile = engine.session(USER, CHANNEL).profile
+    profile.institution = "школа"
+    profile.room = "кабинет технологии"
+
+
+def only_list(responses) -> ProductList:  # noqa: ANN001
+    lists = [r for r in responses if isinstance(r, ProductList)]
+    assert lists, f"в ответе нет выдачи каталога: {responses}"
+    return lists[0]
+
+
 def test_agent_calls_tool_then_answers(engine):
     script = [
         tool_call("search_products", {"query": "фрезерный станок"}),
@@ -176,12 +193,32 @@ def test_agent_calls_tool_then_answers(engine):
     ]
     with FakeCloudRu(script) as cloud:
         attach(engine, client(cloud.base_url))
+        ready(engine)
         responses = engine.handle_text(USER, CHANNEL, "нужен фрезерный станок")
 
     assert isinstance(responses[0], Message)
     assert "2.20.63" in responses[0].text
     # Карточка приложена к ответу, чтобы товар можно было положить в корзину.
     assert any(isinstance(r, ProductCard) for r in responses)
+
+
+def test_cards_wait_until_the_task_is_clear(engine):
+    """Гейт карточек: пока не известны учреждение и зона — только разговор.
+
+    Заказчик сформулировал это прямо: «только после отработки возражений
+    выводить карточку с кнопкой подробнее или в корзину». До того бот вешал
+    карточку на каждое упоминание позиции.
+    """
+    script = [
+        tool_call("search_products", {"query": "фрезерный станок"}),
+        answer("Есть фрезерно-гравировальный станок S1."),
+    ]
+    with FakeCloudRu(script) as cloud:
+        attach(engine, client(cloud.base_url))
+        responses = engine.handle_text(USER, CHANNEL, "нужен фрезерный станок")
+
+    assert isinstance(responses[0], Message)
+    assert not any(isinstance(r, ProductCard) for r in responses)
 
 
 def test_tool_result_reaches_the_model(engine):
@@ -234,8 +271,7 @@ def test_falls_back_to_search_when_model_is_down(engine):
     agent = attach(engine, client("http://127.0.0.1:1/v1", timeout=1.0))
     responses = engine.handle_text(USER, CHANNEL, "фрезерный станок")
 
-    assert isinstance(responses[0], ProductList)
-    assert responses[0].cards[0].product.sku_1c == "S1"
+    assert only_list(responses).cards[0].product.sku_1c == "S1"
     assert not agent.available, "после сбоя модель должна уйти в паузу"
 
 
@@ -248,7 +284,7 @@ def test_cooldown_answers_instantly_without_touching_the_model(engine):
         responses = engine.handle_text(USER, CHANNEL, "фрезерный станок")
 
         assert cloud.requests == [], "в паузе обращений к модели быть не должно"
-    assert isinstance(responses[0], ProductList)
+    only_list(responses)
 
 
 def test_empty_answer_falls_back_to_search(engine):
@@ -256,13 +292,13 @@ def test_empty_answer_falls_back_to_search(engine):
         attach(engine, client(cloud.base_url))
         responses = engine.handle_text(USER, CHANNEL, "фрезерный станок")
 
-    assert isinstance(responses[0], ProductList)
+    only_list(responses)
 
 
 def test_prompts_are_sent_as_system_message(engine):
     with FakeCloudRu([answer("ок")]) as cloud:
         attach(engine, client(cloud.base_url))
-        engine.handle_text(USER, CHANNEL, "привет")
+        engine.handle_text(USER, CHANNEL, "нужен фрезерный станок")
         system = cloud.requests[0]["messages"][0]
 
     assert system["role"] == "system"
@@ -273,13 +309,40 @@ def test_prompts_are_sent_as_system_message(engine):
     assert "не объявляй" in system["content"].lower()
 
 
+def test_question_gets_the_consultant_not_the_salesman(engine):
+    """Роль выбирается до ответа: на вопрос отвечает консультант.
+
+    Раньше все четыре промпта склеивались в один и уходили одному вызову —
+    агенту приходилось быть сразу справочной и продавцом, и он выбирал самое
+    простое: показать товар. Отсюда жалоба «пропал режим диалога».
+    """
+    with FakeCloudRu([answer("Здравствуйте! Чем помочь?")]) as cloud:
+        attach(engine, client(cloud.base_url))
+        engine.handle_text(USER, CHANNEL, "здравствуйте")
+        system = cloud.requests[0]["messages"][0]["content"]
+
+    assert "роль в этом ходе: консультант" in system.lower()
+    assert "роль в этом ходе: продавец" not in system.lower()
+
+
 def test_tools_are_declared_to_the_model(engine):
     with FakeCloudRu([answer("ок")]) as cloud:
         attach(engine, client(cloud.base_url))
-        engine.handle_text(USER, CHANNEL, "привет")
+        engine.handle_text(USER, CHANNEL, "нужен фрезерный станок")
         names = {t["function"]["name"] for t in cloud.requests[0]["tools"]}
 
     assert {"search_products", "find_by_norm_code", "add_to_cart"} <= names
+
+
+def test_consultant_has_no_catalog_tools(engine):
+    """Консультант объясняет документы, а не подбирает — каталог ему не нужен."""
+    with FakeCloudRu([answer("Это перечень для школ.")]) as cloud:
+        attach(engine, client(cloud.base_url))
+        engine.handle_text(USER, CHANNEL, "здравствуйте")
+        names = {t["function"]["name"] for t in cloud.requests[0]["tools"]}
+
+    assert "search_products" not in names
+    assert "explain_norm" in names
 
 
 def test_reasoning_content_survives_the_tool_round(engine):
@@ -339,7 +402,7 @@ def test_search_answers_only_when_every_provider_is_down(engine):
     )
     responses = engine.handle_text(USER, CHANNEL, "фрезерный станок")
 
-    assert isinstance(responses[0], ProductList)
+    only_list(responses)
     assert not agent.available
 
 
@@ -385,7 +448,7 @@ def test_twice_invented_answer_falls_back_to_the_catalog(engine):
         attach(engine, client(cloud.base_url))
         responses = engine.handle_text(USER, CHANNEL, "нужен станок")
 
-    assert isinstance(responses[0], ProductList)
+    only_list(responses)
 
 
 def test_price_from_the_tool_passes_the_check(engine):
@@ -421,7 +484,7 @@ def test_norm_reference_is_available_as_a_tool(engine):
     ]
     with FakeCloudRu(script) as cloud:
         attach(engine, client(cloud.base_url))
-        engine.handle_text(USER, CHANNEL, "клиент спрашивает про документ")
+        engine.handle_text(USER, CHANNEL, "расскажите про перечень")
         tool_result = [m for m in cloud.requests[-1]["messages"] if m.get("role") == "tool"][0]
 
     assert "28 ноября 2024" in tool_result["content"]
@@ -438,6 +501,7 @@ def test_words_instead_of_a_search_get_real_positions_attached(engine):
     )
     with FakeCloudRu([answer(listing)]) as cloud:
         attach(engine, client(cloud.base_url))
+        ready(engine)
         responses = engine.handle_text(USER, CHANNEL, "нужен фрезерный станок")
 
     assert isinstance(responses[0], Message)
@@ -463,3 +527,30 @@ def test_empty_search_is_not_appended_to_a_good_answer(engine):
         responses = engine.handle_text(USER, CHANNEL, "чем оснастить бассейн")
 
     assert len(responses) == 1
+
+
+def test_price_shown_earlier_is_not_invented(engine):
+    """Регрессия 01.09: ответ на «дорого» отвергался проверкой цен.
+
+    Отрабатывая возражение, модель ссылается на уже показанную позицию и в
+    инструменты не ходит. Проверка смотрела только текущий ход, не находила
+    сумму среди его результатов и дважды просила переписать ответ — после чего
+    он терялся, и вместо работы с возражением человек получал выдачу каталога.
+    """
+    first = [
+        tool_call("search_products", {"query": "станок"}),
+        answer("Фрезерный станок с ЧПУ — 253 000 ₽."),
+    ]
+    with FakeCloudRu(first) as cloud:
+        attach(engine, client(cloud.base_url))
+        ready(engine)
+        engine.handle_text(USER, CHANNEL, "нужен фрезерный станок")
+
+    with FakeCloudRu([answer("Понимаю, 253 000 ₽ — заметная сумма. Разобьём закупку на этапы?")]) as cloud:
+        attach(engine, client(cloud.base_url))
+        responses = engine.handle_text(USER, CHANNEL, "дорого")
+
+    assert isinstance(responses[0], Message)
+    assert "253 000" in responses[0].text
+    sent = [m["content"] for r in cloud.requests for m in r["messages"]]
+    assert not any("Перепиши ответ" in text for text in sent), "честный ответ переписывать не нужно"

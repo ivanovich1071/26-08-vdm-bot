@@ -51,6 +51,7 @@ class DialogLogger:
         latency_ms: int,
         cart_count: int,
         usage: dict | None = None,
+        route: dict | None = None,
     ) -> None:
         if not self.enabled:
             return
@@ -71,6 +72,12 @@ class DialogLogger:
             # Пользователю цифры не показываются: это данные для разработки.
             if usage:
                 record["usage"] = usage
+            # Кто отвечал (консультант или продавец), на каком этапе разговор,
+            # какое возражение распознано и почему карточки показаны или нет.
+            # Без этого на ручном прогоне не отличить «бот решил промолчать» от
+            # «бот сломался».
+            if route:
+                record["route"] = route
             self._write(record)
         except Exception as exc:  # журнал не должен ломать разговор
             log.warning("Не удалось записать диалог: %s", exc)

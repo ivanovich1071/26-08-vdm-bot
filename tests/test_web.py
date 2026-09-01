@@ -72,7 +72,10 @@ def test_bad_session_id_is_rejected(client):
 def test_search_returns_list(client):
     session_id = client.post("/widget/session").json()["session_id"]
     body = client.post("/widget/message", json={"session_id": session_id, "text": "мяч"}).json()
-    assert body["responses"][0]["type"] == "list"
+    kinds = [response["type"] for response in body["responses"]]
+    # Без модели ядро сначала предлагает список наименований текстом, а под ним
+    # даёт три карточки — по согласованию с заказчиком.
+    assert kinds[0] == "text" and "list" in kinds
 
 
 def test_widget_js_is_revalidated(client):

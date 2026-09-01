@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 
 from catalog.models import Product
 from catalog.search import CatalogIndex, SearchHit, SearchQuery
+from core import intent
 from core.config import Settings
 from core.models import CartItem, Customer
 from core.profile import DialogProfile
@@ -92,6 +93,20 @@ PAGE_SIZE = 3
 # Верхний предел выборки: больше пользователю всё равно не показать,
 # а отдавать в агент сотни позиций дорого и бессмысленно.
 SEARCH_CAP = 50
+# Сколько наименований перечисляем текстом, когда отвечаем без модели. Список
+# читается одним взглядом и даёт понять, что вообще есть, а подробности —
+# в трёх карточках под ним.
+OFFER_NAMES = 10
+
+# Постоянная клавиатура Telegram присылает нажатие обычным текстом — сопоставляем
+# его с действием. Ключи в нижнем регистре, сравнение тоже.
+KEYBOARD_ACTIONS: dict[str, str] = {
+    "каталог": "catalog",
+    "моя корзина": "cart",
+    "корзина": "cart",
+    "менеджер": "manager",
+    "связаться с менеджером": "manager",
+}
 
 
 @dataclass
@@ -124,6 +139,15 @@ class Session:
     # в агенте, потому что ходы разных людей считаются одновременно, в разных
     # потоках. В журнал уходит по завершении хода и обнуляется перед следующим.
     usage: dict[str, object] = field(default_factory=dict)
+    # Кто отвечал и почему: роль, этап, возражение, показаны ли карточки и по
+    # какой причине. Заполняет агент, читает журнал. На ручных прогонах без этого
+    # не понять, почему бот промолчал карточками, — а прогоны заказчик делает сам.
+    route: dict[str, object] = field(default_factory=dict)
+    # Все цены, которые инструменты вернули за этот разговор. Проверка на
+    # выдуманные суммы смотрела только текущий ход — и отвергала ответ, где
+    # модель ссылается на позицию, показанную ходом раньше. Именно так теряется
+    # ответ на возражение «дорого»: там инструменты не вызываются вовсе.
+    prices: set[int] = field(default_factory=set)
 
     def remember(self, role: str, content: str) -> None:
         self.history.append({"role": role, "content": self.masker.mask(content)})
@@ -133,6 +157,7 @@ class Session:
         self.history.clear()
         self.profile = DialogProfile()
         self.masker = Masker()
+        self.prices.clear()
 
 
 class DialogEngine:
@@ -204,6 +229,7 @@ class DialogEngine:
         session = self.session(user_id, channel)
         collecting = session.checkout_step is not None
         session.usage = {}
+        session.route = {}
         responses = self._handle_text(user_id, channel, text)
         logged = "<контактные данные при оформлении>" if collecting else text
         self._log(user_id, channel, "text", logged, responses, started)
@@ -228,6 +254,7 @@ class DialogEngine:
             return
         agent = self.agent
         mode = "search" if agent is None or not getattr(agent, "available", True) else "agent"
+        session = self.session(user_id, channel)
         self.dialog_log.turn(
             channel=channel,
             user_id=user_id,
@@ -237,7 +264,8 @@ class DialogEngine:
             mode=mode,
             latency_ms=int((time.monotonic() - started) * 1000),
             cart_count=self.storage.load_cart(user_id).count,
-            usage=self.session(user_id, channel).usage or None,
+            usage=session.usage or None,
+            route=session.route or None,
         )
 
     def _handle_text(self, user_id: str, channel: str, text: str) -> list[Response]:
@@ -251,6 +279,12 @@ class DialogEngine:
         if session.checkout_step is not None:
             return self._collect_contact(session, text)
 
+        # Нажатие постоянной клавиатуры приходит обычным текстом. Разбираем его
+        # до обновления профиля: иначе слово «Каталог» уйдёт в разбор задачи.
+        action = KEYBOARD_ACTIONS.get(text.strip().lower())
+        if action is not None:
+            return self._handle_action(user_id, channel, action)
+
         # Профиль обновляем до ответа: то, что человек сказал сейчас, должно
         # попасть в промпт этого же хода, а не следующего.
         session.profile.update_from_text(text)
@@ -262,7 +296,7 @@ class DialogEngine:
         elif self.agent is not None:
             responses = self.agent.reply(session, text)
         else:
-            responses = self.search(session, text)
+            responses = self.offer(session, text)
 
         self._remember(session)
         return responses
@@ -362,7 +396,9 @@ class DialogEngine:
 
     # --- Поиск и карточки -----------------------------------------------------
 
-    def search(self, session: Session, text: str, limit: int = PAGE_SIZE) -> list[Response]:
+    def search(
+        self, session: Session, text: str, limit: int = PAGE_SIZE, title: str | None = None
+    ) -> list[Response]:
         hits = self.index.search(
             SearchQuery(text=text, limit=SEARCH_CAP, audience=session.profile.audience)
         )
@@ -377,8 +413,72 @@ class DialogEngine:
                 )
             ]
 
-        title = self._result_title(hits, text)
-        return [self._list(hits[:limit], title, len(hits), offset=0)]
+        return [
+            self._list(hits[:limit], title or self._result_title(hits, text), len(hits), offset=0)
+        ]
+
+    def offer(self, session: Session, text: str) -> list[Response]:
+        """Ответ, когда модели нет: сеть упала, кончились деньги, ключ не вписан.
+
+        Раньше здесь стоял прямой вызов `search`, и любой текст уходил в каталог.
+        1 сентября бот ответил на «привет» списком из пятидесяти товаров, а на
+        «а почему на мой привет ты мне товарами отвечаешь?» — ещё пятьюдесятью.
+        Поиск перестал быть ответом по умолчанию.
+
+        Что осталось без модели, то и предлагаем честно: список наименований и
+        три карточки под ним — по согласованию с заказчиком.
+        """
+        kind = intent.classify(text)
+
+        if kind in (intent.GREETING, intent.SMALL_TALK):
+            return [
+                Message(
+                    "Здравствуйте! Я консультант ЭЛТИ-КУДИЦ. Подбираете для "
+                    "детского сада или для школы?",
+                    keyboard=self._main_menu(),
+                )
+            ]
+
+        if kind not in (intent.PRODUCT, intent.NORM_CODE):
+            return [
+                Message(
+                    "Сейчас я отвечаю проще обычного — консультант временно "
+                    "недоступен. Могу показать каталог или найти позиции по "
+                    "пункту перечня, например «2.1.14».\n"
+                    f"По остальным вопросам — менеджер: {self.settings.manager_contact}.",
+                    keyboard=self._offer_menu(),
+                )
+            ]
+
+        hits = self.index.search(
+            SearchQuery(text=text, limit=SEARCH_CAP, audience=session.profile.audience)
+        )
+        session.last_hits = hits
+        if not hits:
+            return [
+                Message(
+                    "Ничего не нашёл по этому запросу. Попробуйте назвать товар иначе "
+                    "или указать пункт приказа — например, «2.1.14».\n"
+                    f"Если нужно, подключим менеджера: {self.settings.manager_contact}.",
+                    keyboard=self._offer_menu(),
+                )
+            ]
+
+        shown = hits[:OFFER_NAMES]
+        names = "\n".join(f"• {hit.product.name}" for hit in shown)
+        header = "Могу предложить товары из каталога"
+        if len(hits) > len(shown):
+            header += f" — вот {len(shown)} из {self._found(hits)}"
+        return [
+            Message(f"{header}:\n\n{names}", keyboard=self._offer_menu()),
+            self._list(hits[:PAGE_SIZE], "Первые три — подробнее", len(hits), offset=0),
+        ]
+
+    def _offer_menu(self) -> Keyboard:
+        return Keyboard().row(
+            Button("Каталог", "catalog"),
+            Button("Связаться с менеджером", "manager"),
+        )
 
     def _more(self, session: Session, offset: int) -> list[Response]:
         hits = session.last_hits
@@ -509,12 +609,18 @@ class DialogEngine:
             log.warning("Фото для %s не получено: %s", product.sku_1c, exc)
             return None
 
+    def _found(self, hits: list[SearchHit]) -> str:
+        """«24 позиции» или «более 50 позиций».
+
+        Выдача ограничена сверху, поэтому ровно на пределе честнее сказать «более»:
+        иначе бот сообщает как точное число размер собственной выборки.
+        """
+        if len(hits) >= SEARCH_CAP:
+            return f"более {SEARCH_CAP} позиций"
+        return f"{len(hits)} {plural(len(hits), 'позиция', 'позиции', 'позиций')}"
+
     def _result_title(self, hits: list[SearchHit], text: str) -> str:
-        # Выдача ограничена сверху, поэтому ровно на пределе честнее сказать «более»:
-        # иначе бот сообщает как точное число размер собственной выборки.
-        capped = len(hits) >= SEARCH_CAP
-        word = plural(len(hits), "позиция", "позиции", "позиций")
-        count = f"более {SEARCH_CAP} позиций" if capped else f"{len(hits)} {word}"
+        count = self._found(hits)
         if hits and hits[0].by_norm:
             code = hits[0].matched_code
             return f"По пункту {code}: {count}" if code else f"По перечню: {count}"
