@@ -63,3 +63,25 @@ def test_quantities_are_not_mistaken_for_a_budget():
     profile.update_from_text("нужно 20 мячей и 5 обручей")
 
     assert profile.budget is None
+
+
+def test_a_kindergarten_is_recognised_without_the_word_kindergarten():
+    """02.09: «спортзал в саду» не дал учреждения — и человек остался без кнопок."""
+    profile = DialogProfile()
+    profile.update_from_text("чем оснастить спортзал в саду, дети 3–6 лет")
+
+    assert profile.institution == "детский сад"
+    assert profile.room == "спортивный зал"
+    assert profile.task_known
+
+
+def test_a_question_about_a_document_is_not_a_purchase_decision():
+    """31.08: вопрос про приказ 838 перевёл весь разговор в школьный режим."""
+    profile = DialogProfile()
+    profile.update_from_text("что значит приказ 838")
+
+    assert profile.asked_about_docs == ["order_838"]
+    assert profile.norm_doc_ids == []
+
+    profile.update_from_text("нужно оборудование для группы в детском саду")
+    assert profile.audience == "preschool"

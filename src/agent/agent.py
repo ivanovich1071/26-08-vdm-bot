@@ -19,9 +19,11 @@
 подставляется в системный промпт. Без неё бот переспрашивал возраст детей, который
 ему назвали ходом раньше, — это видно в журнале диалогов.
 
-**Проверяет цены в ответе.** Всё, что похоже на сумму, должно встречаться среди
-результатов инструментов. Не совпало — просим переписать, а если не помогло,
-отвечаем выдачей каталога. Выдуманная цена дороже молчания.
+**Проверяет цены и нормативные основания в ответе.** Всё, что похоже на сумму или
+на ссылку «пункт такой-то приказа такого-то», должно встречаться среди результатов
+инструментов. Не совпало — просим переписать, а если не помогло, отвечаем выдачей
+каталога. Выдуманная цена дороже молчания, а выдуманное основание — дороже цены:
+по нему принимают закупку.
 
 **Дописывает каталог, когда модель обошлась без него.** Ответ списком общих слов —
 «мячи, обручи, скакалки» — промптом не лечится: проверено на живых прогонах.
@@ -40,7 +42,13 @@ from agent.client import ChatClient, LLMError
 from agent.providers import LLMRouter
 from agent.routing import CONSULT, GUARD, SELL, Decision, Router
 from agent.tools import TOOL_SCHEMAS, ToolBox
-from agent.verify import invented_prices, prices_in, talks_about_goods
+from agent.verify import (
+    describe_refs,
+    invented_norm_refs,
+    invented_prices,
+    prices_in,
+    talks_about_goods,
+)
 from core.ui import Button, Keyboard, Message, ProductCard, ProductList, Response
 
 log = logging.getLogger(__name__)
@@ -51,6 +59,15 @@ HISTORY_LIMIT = 12
 # Сколько карточек прикладываем к ответу модели. Заказчик отдельно попросил
 # не больше трёх: пять карточек подряд читаются как выгрузка, а не как подбор.
 CARDS_SHOWN = 3
+
+# Чего мы ждём от переписанного ответа. Отдельной строкой, чтобы просьба звучала
+# одинаково и для выдуманной цены, и для выдуманного пункта приказа.
+_REWRITE_HINT = (
+    " Названия, цены и пункты перечней бери только из вызовов инструментов. "
+    "Номер пункта всегда называй вместе с приказом, а формулировку — только ту, "
+    "что вернул инструмент. Перепиши ответ: оставь лишь подтверждённые позиции, "
+    "а чего в каталоге нет — так и скажи."
+)
 
 # Код 1С в ответе модели: она обязана его называть, чтобы карточки сошлись с
 # текстом, а перед показом человеку код вырезается — он служебный.
@@ -70,7 +87,10 @@ ROLE_PARTS: dict[str, tuple[str, ...]] = {
 # Какие инструменты доступны роли. Консультанту каталог не нужен: он объясняет
 # документы, а не подбирает. Охране не нужно ничего.
 ROLE_TOOLS: dict[str, tuple[str, ...]] = {
-    CONSULT: ("explain_norm", "get_cart", "handoff_to_manager"),
+    # Справочник пунктов приказа консультанту нужен не меньше, чем справка по
+    # самому документу: «что такое пункт 2.1.14» — это его вопрос, и отвечать
+    # на него по памяти он не должен.
+    CONSULT: ("explain_norm", "find_norm_item", "get_cart", "handoff_to_manager"),
     SELL: (),  # пустой кортеж — значит все
     GUARD: ("__none__",),
 }
@@ -93,22 +113,35 @@ def tools_for(branch: str) -> list[dict] | None:
     return chosen or None
 
 
-def may_show_cards(profile, decision: Decision) -> tuple[bool, str]:  # noqa: ANN001
+def may_show_cards(
+    profile,  # noqa: ANN001
+    decision: Decision,
+    named_positions: bool = False,
+) -> tuple[bool, str]:
     """Можно ли приложить к ответу карточки товаров — и почему.
 
     Заказчик сформулировал правило так: «только после отработки возражений
     выводить карточку с кнопкой подробнее или в корзину, бот должен быть живым,
     а не просто связывать карточки и корзину». Причина решения возвращается
     наружу и пишется в журнал — иначе на прогоне не понять, почему бот промолчал.
+
+    `named_positions` — модель уже назвала конкретные позиции из каталога.
+    Тогда требование «сначала выясни учреждение и зону» снимается: 02.09 на
+    реплику «чем оснастить спортзал в саду» бот перечислил три позиции с ценами
+    и пунктами приказа, а карточек не дал — и человеку было нечем положить их в
+    корзину. Товар с ценой в тексте и без кнопки хуже, чем товар с кнопкой.
+    Гейт по возражению при этом остаётся: он и есть суть правила заказчика.
     """
     if decision.branch != SELL:
         return False, "ветка консультирования"
     if profile.objection != "none" and not profile.objection_handled:
         return False, f"возражение не снято ({profile.objection})"
-    if not profile.ready_to_see:
+    if not profile.ready_to_see and not named_positions:
         return False, "клиент не просил показывать"
-    if not profile.task_known and not decision.precise:
+    if not profile.task_known and not decision.precise and not named_positions:
         return False, "не выяснены учреждение и зона"
+    if named_positions and not (profile.task_known or profile.ready_to_see):
+        return True, "позиции уже названы в ответе"
     return True, "задача ясна, клиент готов смотреть"
 
 
@@ -152,13 +185,23 @@ class SalesAgent:
         try:
             answer = self._ask(messages, tools, tools_for(decision.branch))
             session.prices |= tools.prices
+            session.norm_refs |= tools.norm_refs
         except LLMError:
             # Провайдеры уже помечены нерабочими и записаны в лог — здесь остаётся
             # только доиграть ход предложением из каталога.
             return self.engine.offer(session, text)
 
-        answer = self._without_invented_prices(answer, messages, tools, text, session)
+        # Гейт пересчитываем, когда ход уже сыгран: до вызова модели неизвестно,
+        # назовёт ли она конкретные позиции, а от этого зависит, будет ли человеку
+        # чем воспользоваться.
+        show_cards, reason = may_show_cards(session.profile, decision, bool(tools.shown_skus))
+        session.route["cards"] = {"allowed": show_cards, "reason": reason}
+        if tools.norm_lookups:
+            session.route["norm_lookups"] = tools.norm_lookups
+
+        answer = self._verified(answer, messages, tools, text, session)
         if not answer:
+            session.route["discarded_answer"] = True
             return self.engine.offer(session, text)
 
         answer = session.masker.unmask(answer)
@@ -182,15 +225,22 @@ class SalesAgent:
         """
         by_code = [sku for sku in tools.shown_skus if sku in answer]
         if by_code:
-            return _unique(by_code)
+            return _unique([sku for sku in by_code if not _rejected(answer, sku)])
 
         words = _significant(answer)
         pairs = {(words[i], words[i + 1]) for i in range(len(words) - 1)}
         matched = []
         for sku in _unique(tools.shown_skus):
             product = self.engine.index.get(sku)
-            if product is not None and _named_in(product.name, words, pairs):
-                matched.append(sku)
+            if product is None or not _named_in(product.name, words, pairs):
+                continue
+            # Модель бывает права, отказывая: 01.09 она сама выяснила, что код
+            # 45892 — игрушечный бронемобиль, честно об этом написала, а карточка
+            # бронемобиля всё равно пришла — «упомянут» и «рекомендован» тут не
+            # различались. Сомневаемся — карточку не показываем.
+            if _rejected(answer, product.name):
+                continue
+            matched.append(sku)
         return matched
 
     # --- Цикл вызова инструментов -------------------------------------------
@@ -254,56 +304,63 @@ class SalesAgent:
 
     # --- Проверка ответа -------------------------------------------------------
 
-    def _without_invented_prices(  # noqa: ANN001
+    def _verified(  # noqa: ANN001
         self, answer: str, messages: list[dict], tools: ToolBox, question: str, session
     ) -> str:
-        """Ответ, в котором каждая сумма подтверждена данными.
+        """Ответ, в котором каждая сумма и каждый пункт приказа подтверждены данными.
 
         Одна попытка исправиться: модель почти всегда переписывает ответ честно,
         когда ей называют конкретные лишние числа. Если и второй ответ выдуман,
         возвращаем пустую строку — вызывающая сторона ответит выдачей каталога.
         """
-        # Цены за весь разговор, а не только за этот ход. Отвечая на «дорого»,
-        # модель ссылается на уже показанные позиции и в инструменты не ходит —
-        # проверка по одному ходу отвергала такой ответ дважды подряд и роняла
-        # его в выдачу каталога. Поймано на живом прогоне 01.09.
-        allowed = (
+        # Цены и основания за весь разговор, а не только за этот ход. Отвечая на
+        # «дорого», модель ссылается на уже показанные позиции и в инструменты не
+        # ходит — проверка по одному ходу отвергала такой ответ дважды подряд и
+        # роняла его в выдачу каталога. Поймано на живом прогоне 01.09.
+        prices = (
             tools.prices
             | session.prices
             | prices_in(question)
             | prices_in(session.profile.budget or "")
         )
-        invented = invented_prices(answer, allowed)
-        if not invented:
+        refs = tools.norm_refs | session.norm_refs
+        complaint = self._complaint(answer, prices, refs)
+        if not complaint:
             return answer
 
-        log.warning(
-            "Модель назвала суммы, которых нет в данных: %s. Просим переписать ответ.",
-            ", ".join(str(price) for price in sorted(invented)),
-        )
+        log.warning("%s Просим переписать ответ.", complaint)
         messages.append({"role": "assistant", "content": answer, "reasoning_content": ""})
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "В твоём ответе есть суммы, которых нет в результатах инструментов: "
-                    + ", ".join(f"{price} ₽" for price in sorted(invented))
-                    + ". Названия и цены товаров бери только из вызовов инструментов. "
-                    "Перепиши ответ: оставь лишь подтверждённые позиции, а чего в "
-                    "каталоге нет — так и скажи."
-                ),
-            }
-        )
+        messages.append({"role": "user", "content": complaint + _REWRITE_HINT})
         try:
             second = self._ask(messages, tools, TOOL_SCHEMAS)
         except LLMError:
             return ""
 
-        allowed |= tools.prices
-        if invented_prices(second, allowed):
+        prices |= tools.prices
+        refs |= tools.norm_refs
+        if self._complaint(second, prices, refs):
             log.warning("Ответ выдуман повторно — отвечаем выдачей каталога.")
             return ""
         return second
+
+    def _complaint(
+        self, answer: str, prices: set[int], refs: set[tuple[str, str]]
+    ) -> str:
+        """Что в ответе не подтверждено данными. Пустая строка — всё в порядке."""
+        parts: list[str] = []
+        invented = invented_prices(answer, prices)
+        if invented:
+            parts.append(
+                "суммы, которых нет в результатах инструментов: "
+                + ", ".join(f"{price} ₽" for price in sorted(invented))
+            )
+        wrong_refs = invented_norm_refs(answer, refs)
+        if wrong_refs:
+            parts.append(
+                "нормативные основания, которых инструменты не возвращали: "
+                + describe_refs(wrong_refs)
+            )
+        return f"В твоём ответе есть {' и '.join(parts)}." if parts else ""
 
     # --- Сборка ответа --------------------------------------------------------
 
@@ -326,16 +383,14 @@ class SalesAgent:
             # ответе они ни к чему — это внутренний артикул, а не характеристика.
             responses.append(Message(_without_codes(answer), keyboard=self._keyboard(tools)))
 
-        audience = session.profile.audience
         for sku in mentioned[:CARDS_SHOWN]:
             product = self.engine.index.get(sku)
             if product is None:
                 continue
-            norm = product.norm_for(audience, session.profile.room or "")
             responses.append(
                 ProductCard(
                     product=product,
-                    citation=norm.citation if norm else None,
+                    citation=self._citation(session, product),
                     keyboard=Keyboard().row(
                         Button("В корзину", f"add:{sku}"),
                         Button("Подробнее", f"card:{sku}"),
@@ -373,6 +428,20 @@ class SalesAgent:
                 log.warning("Ответ без обращения к каталогу — дописываем выдачу поиска.")
                 responses += found
         return responses
+
+    def _citation(self, session, product) -> str | None:  # noqa: ANN001
+        """Основание для карточки — то же, что бот назвал в тексте.
+
+        Раньше текст брал основание из результата поиска, а карточка считала его
+        заново по аудитории профиля, и в одном сообщении оказывались два разных
+        приказа: «привязана к приказу 838» в тексте и «позиция 1.13.4.3.1.6 —
+        приказ 1057» на карточке под ним.
+        """
+        for hit in session.last_hits or ():
+            if hit.product.sku_1c == product.sku_1c:
+                return hit.citation()
+        norm = product.norm_for(session.profile.audience, session.profile.room or "")
+        return norm.citation if norm else None
 
     def _catalog_query(self, session, question: str) -> str:  # noqa: ANN001
         """Чем искать, когда искать приходится за модель.
@@ -482,6 +551,34 @@ def _significant(text: str) -> list[str]:
     from catalog.text import stems
 
     return [word for word in stems(text) if len(word) > 2 and not word.isdigit()]
+
+
+# Модель отговаривает от позиции, а не предлагает её.
+_REJECTION = re.compile(
+    r"не\s+подойд\w+|не\s+подход\w+|не\s+соответству\w+|не\s+рекоменд\w+|"
+    r"не\s+относ\w+|не\s+числ\w+|не\s+для\s+|вряд\s+ли|ошибочн\w+|"
+    r"это\s+не\s+то|исключ\w+\s+из|игрушечн\w+",
+    re.IGNORECASE,
+)
+# Предложения делим по точке с большой буквы, переводу строки и точке с запятой.
+_SENTENCE = re.compile(r"(?<=[.!?;])\s+|\n+")
+
+
+def _rejected(answer: str, needle: str) -> bool:
+    """Названо ли это только затем, чтобы отказать.
+
+    Смотрим предложения, где позиция упомянута: если все они содержат отказ,
+    карточке под ответом взяться неоткуда.
+    """
+    words = _significant(needle)
+    if not words:
+        return False
+    mentions = []
+    for sentence in _SENTENCE.split(answer or ""):
+        low = sentence.lower()
+        if needle.lower() in low or all(word in low for word in words[:2]):
+            mentions.append(sentence)
+    return bool(mentions) and all(_REJECTION.search(sentence) for sentence in mentions)
 
 
 def _named_in(name: str, words: list[str], pairs: set[tuple[str, str]]) -> bool:

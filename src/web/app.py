@@ -46,9 +46,9 @@ class ActionIn(BaseModel):
     action: str = Field(min_length=1, max_length=128)
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, warm_llm: bool = False) -> FastAPI:
     settings = settings or Settings.from_env()
-    engine = build_engine(settings)
+    engine = build_engine(settings, warm_llm=warm_llm)
     app = FastAPI(title="ЭЛТИ-КУДИЦ · бот-консультант", docs_url=None, redoc_url=None)
 
     # Виджет ставится на сайт заказчика, поэтому список источников задаётся явно:
@@ -134,7 +134,13 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings = Settings.from_env()
-    uvicorn.run(create_app(settings), host=settings.widget_host, port=settings.widget_port)
+    uvicorn.run(
+        # Прогрев провайдера при запуске: отказ Cloud.ru должен стоить времени
+        # старта, а не первого сообщения пользователя.
+        create_app(settings, warm_llm=True),
+        host=settings.widget_host,
+        port=settings.widget_port,
+    )
 
 
 if __name__ == "__main__":

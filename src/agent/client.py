@@ -26,7 +26,17 @@ class LLMError(RuntimeError):
 
 
 class LLMAuthError(LLMError):
-    """Ключ не принят или на счету нет средств. Повторять запрос бессмысленно."""
+    """Ключ не принят или доступ закрыт. Повторять запрос бессмысленно."""
+
+
+class LLMPaymentError(LLMAuthError):
+    """На счету провайдера нет средств.
+
+    От «не тот ключ» отличается тем, что чинится без нас: заказчик пополняет
+    счёт, и провайдер оживает сам. Поэтому отказ по деньгам держит провайдера
+    в стороне пять минут, а не полчаса, — иначе после пополнения бот ещё
+    полчаса разговаривает запасной моделью.
+    """
 
 
 @dataclass
@@ -35,7 +45,7 @@ class ChatClient:
     base_url: str = "https://foundation-models.api.cloud.ru/v1"
     model: str = "deepseek-ai/DeepSeek-V4-Flash"
     timeout: float = 60.0
-    max_tokens: int = 1200
+    max_tokens: int = 2000
     # Как провайдер называется в логах и в диагностике: «cloudru», «openrouter».
     name: str = "cloudru"
     # OpenRouter просит указать, откуда пришёл запрос; Cloud.ru лишние заголовки
@@ -64,7 +74,7 @@ class ChatClient:
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
-            # Маршрутизатору нужен короткий JSON, а не полторы тысячи токенов:
+            # Маршрутизатору нужен короткий JSON, а не две тысячи токенов:
             # предел задаётся вызовом, иначе за него платим впустую.
             "max_tokens": max_tokens or self.max_tokens,
         }
@@ -89,9 +99,11 @@ class ChatClient:
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:400]
             message = f"{self.name} вернул {exc.code}: {detail}"
-            # 401 — не тот ключ, 402 — нет средств, 403 — ключу закрыт доступ.
-            # Пробовать ещё раз или ждать паузу смысла нет, нужен человек.
-            if exc.code in {401, 402, 403}:
+            # 401 — не тот ключ, 403 — ключу закрыт доступ: нужен человек.
+            # 402 — кончились деньги: чинится пополнением, ждать полчаса незачем.
+            if exc.code == 402:
+                raise LLMPaymentError(message) from exc
+            if exc.code in {401, 403}:
                 raise LLMAuthError(message) from exc
             raise LLMError(message) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:

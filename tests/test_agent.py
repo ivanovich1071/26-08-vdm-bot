@@ -202,12 +202,14 @@ def test_agent_calls_tool_then_answers(engine):
     assert any(isinstance(r, ProductCard) for r in responses)
 
 
-def test_cards_wait_until_the_task_is_clear(engine):
-    """Гейт карточек: пока не известны учреждение и зона — только разговор.
+def test_named_position_comes_with_a_card(engine):
+    """Позиция названа в ответе — под ней есть кнопка.
 
-    Заказчик сформулировал это прямо: «только после отработки возражений
-    выводить карточку с кнопкой подробнее или в корзину». До того бот вешал
-    карточку на каждое упоминание позиции.
+    Гейт карточек ставился ради возражений: «только после отработки возражений
+    выводить карточку с кнопкой подробнее или в корзину». Но он же требовал знать
+    учреждение и зону, и 02.09 бот перечислил три позиции с ценами и пунктами
+    приказа, не дав ни одной кнопки, — человек написал «нажал добавить в корзину,
+    а корзина пуста». Товар с ценой в тексте и без кнопки — это тупик.
     """
     script = [
         tool_call("search_products", {"query": "фрезерный станок"}),
@@ -218,7 +220,7 @@ def test_cards_wait_until_the_task_is_clear(engine):
         responses = engine.handle_text(USER, CHANNEL, "нужен фрезерный станок")
 
     assert isinstance(responses[0], Message)
-    assert not any(isinstance(r, ProductCard) for r in responses)
+    assert any(isinstance(r, ProductCard) for r in responses)
 
 
 def test_tool_result_reaches_the_model(engine):
@@ -554,3 +556,39 @@ def test_price_shown_earlier_is_not_invented(engine):
     assert "253 000" in responses[0].text
     sent = [m["content"] for r in cloud.requests for m in r["messages"]]
     assert not any("Перепиши ответ" in text for text in sent), "честный ответ переписывать не нужно"
+
+
+def test_invented_norm_reference_is_sent_back_for_a_rewrite(engine):
+    """Регрессия 01.09: «соответствует пункту 2.20.63 приказа 1057».
+
+    2.20.63 — фрезерный станок из приказа 838. Цитата выглядела так же
+    убедительно, как цена, и доходила до человека непроверенной: сверялись
+    только суммы.
+    """
+    script = [
+        tool_call("search_products", {"query": "станок"}),
+        answer("Станок S1 — 253 000 ₽, соответствует пункту 2.20.63 приказа 1057."),
+        answer("Станок S1 — 253 000 ₽, позиция 2.20.63 приказа 838."),
+    ]
+    with FakeCloudRu(script) as cloud:
+        attach(engine, client(cloud.base_url))
+        responses = engine.handle_text(USER, CHANNEL, "нужен станок")
+
+    assert "838" in responses[0].text
+    assert "1057" not in responses[0].text
+    correction = cloud.requests[-1]["messages"][-1]["content"]
+    assert "2.20.63" in correction
+
+
+def test_rejected_product_does_not_come_as_a_card(engine):
+    """01.09: модель написала, что позиция не подходит, а карточка всё равно пришла."""
+    script = [
+        tool_call("search_products", {"query": "станок"}),
+        answer("Фрезерный станок с ЧПУ вам не подойдёт — это оборудование для школьных мастерских."),
+    ]
+    with FakeCloudRu(script) as cloud:
+        attach(engine, client(cloud.base_url))
+        responses = engine.handle_text(USER, CHANNEL, "нужен станок")
+
+    assert isinstance(responses[0], Message)
+    assert not any(isinstance(item, ProductCard) for item in responses)

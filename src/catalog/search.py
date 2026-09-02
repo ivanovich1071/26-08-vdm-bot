@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 
 from catalog.models import Product
 from catalog.text import expand, stems, trigrams
+from norms import documents as norm_docs
 from norms.extract import codes_in_query, document_ids_in_text
 
 # Вес поля в BM25. Название и раздел каталога описывают товар, описание — уговаривает
@@ -31,6 +32,10 @@ FIELD_WEIGHTS = {"name": 4.0, "category": 2.2, "kit": 1.0, "description": 0.7}
 # вообще без выдачи там, где заказчик разложил товары иначе, чем мы ожидаем.
 _AUDIENCE_BOOST = 1.6
 _AUDIENCE_PENALTY = 0.55
+# Товар без привязки к ветке каталога: не чужой, но и обосновать его нечем.
+# Штраф мягче, чем у чужой аудитории, — иначе там, где заказчик разложил товары
+# не так, как мы ожидаем, человек остался бы вовсе без выдачи.
+_UNKNOWN_AUDIENCE_PENALTY = 0.8
 
 _K1 = 1.4
 _B = 0.75
@@ -70,8 +75,9 @@ class SearchQuery:
     root: str | None = None
     norm_doc_id: str | None = None
     norm_code: str | None = None
-    # Кому подбираем: preschool | school | None. Не отсекает выдачу, а меняет
-    # порядок и выбор нормативного основания.
+    # Кому подбираем: preschool | school | None. В текстовом поиске меняет
+    # порядок, в поиске по номеру пункта отсекает чужие перечни: номер 2.1.14
+    # из школьного приказа не должен отвечать на садовский запрос.
     audience: str | None = None
 
 
@@ -85,16 +91,32 @@ class SearchHit:
     matched_code: str | None = None
     audience: str | None = None
     query: str = ""
+    # Документ, в котором стоит найденный пункт. Один и тот же номер бывает и в
+    # 838, и в 1057 (таких пар в каталоге больше сотни), поэтому без документа
+    # цитата бралась у первого попавшегося основания с этим номером — и на
+    # школьном товаре появлялось «позиция 2.1.14 — приказ 1057».
+    matched_doc_id: str | None = None
 
     @property
     def by_norm(self) -> bool:
         return self.reason == "norm_code"
 
+    def matched_norm(self):  # noqa: ANN201 — norms.extract.NormLink
+        """Основание, по которому товар нашёлся."""
+        if not self.matched_code:
+            return None
+        for ref in self.product.norms:
+            if ref.item_code != self.matched_code:
+                continue
+            if self.matched_doc_id and ref.doc_id != self.matched_doc_id:
+                continue
+            return ref
+        return None
+
     def citation(self) -> str | None:
-        if self.matched_code:
-            for ref in self.product.norms:
-                if ref.item_code == self.matched_code:
-                    return ref.citation
+        matched = self.matched_norm()
+        if matched is not None:
+            return matched.citation
         ref = self.product.norm_for(self.audience, self.query)
         return ref.citation if ref else None
 
@@ -118,7 +140,16 @@ class CatalogIndex:
     _postings: dict[str, list[_Posting]] = field(default_factory=lambda: defaultdict(list))
     _lengths: list[float] = field(default_factory=list)
     _avg_length: float = 0.0
-    _by_norm_code: dict[str, list[int]] = field(default_factory=lambda: defaultdict(list))
+    # Ключ — пара «документ, пункт», а не один пункт. Номер 2.1.14 есть и в 838
+    # (речевые игры для начальной школы), и в чужих ожиданиях про 1057, где его
+    # нет вовсе. Пока ключом был голый номер, запрос «2.1.14 по приказу 1057»
+    # возвращал школьный товар и выдавал его за садовский.
+    _by_norm_code: dict[tuple[str, str], list[int]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+    # Какие пункты вообще есть у документа — чтобы честно отвечать «такого
+    # пункта в этом приказе нет» без перебора каталога.
+    _codes_by_doc: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     _by_sku: dict[str, int] = field(default_factory=dict)
     _name_trigrams: list[set[str]] = field(default_factory=list)
     _by_prefix: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
@@ -131,8 +162,11 @@ class CatalogIndex:
     def _build(self) -> None:
         for doc, product in enumerate(self.products):
             self._by_sku[product.sku_1c] = doc
-            for code in product.norm_codes:
-                self._by_norm_code[code].append(doc)
+            for ref in product.norms:
+                if not ref.item_code:
+                    continue
+                self._by_norm_code[(ref.doc_id, ref.item_code)].append(doc)
+                self._codes_by_doc[ref.doc_id].add(ref.item_code)
             self._name_trigrams.append(trigrams(product.name))
 
             weights: dict[str, float] = defaultdict(float)
@@ -183,8 +217,17 @@ class CatalogIndex:
         doc = self._by_sku.get(sku_1c)
         return self.products[doc] if doc is not None else None
 
-    def by_norm_code(self, code: str) -> list[Product]:
-        return [self.products[doc] for doc in self._by_norm_code.get(code, ())]
+    def by_norm_code(self, code: str, doc_id: str | None = None) -> list[Product]:
+        found: list[Product] = []
+        for (known_doc, known_code), docs in self._by_norm_code.items():
+            if known_code != code or (doc_id and known_doc != doc_id):
+                continue
+            found += [self.products[doc] for doc in docs]
+        return found
+
+    def documents_with_code(self, code: str) -> list[str]:
+        """В каких приказах есть такой пункт — по привязкам каталога."""
+        return sorted({doc for doc, codes in self._codes_by_doc.items() if code in codes})
 
     # --- Составляющие -------------------------------------------------------
 
@@ -212,30 +255,56 @@ class CatalogIndex:
         hits: dict[str, SearchHit] = {}
         audience = query.audience if query else None
         text = query.text if query else ""
+        wanted = self._documents_for(query)
 
-        def keep(doc: int, score: float, code: str) -> None:
+        def keep(doc: int, score: float, code: str, doc_id: str) -> None:
             # Товар закрывает несколько пунктов подраздела — в выдаче он один раз.
             sku = self.products[doc].sku_1c
             if sku not in hits:
                 hits[sku] = SearchHit(
-                    self.products[doc], score, "norm_code", code, audience, text
+                    self.products[doc], score, "norm_code", code, audience, text, doc_id
                 )
 
         for code in codes:
-            exact = [doc for doc in self._by_norm_code.get(code, ()) if doc in allowed]
-            for doc in exact:
-                keep(doc, 1_000.0, code)
+            exact = [
+                (doc_id, doc)
+                for (doc_id, known), docs in self._by_norm_code.items()
+                if known == code and (wanted is None or doc_id in wanted)
+                for doc in docs
+                if doc in allowed
+            ]
+            for doc_id, doc in exact:
+                keep(doc, 1_000.0, code, doc_id)
             if exact:
                 continue
             # «2.4» должно находить всё содержимое подраздела.
             prefix = f"{code}."
-            for known, docs in self._by_norm_code.items():
+            for (doc_id, known), docs in self._by_norm_code.items():
                 if not known.startswith(prefix):
+                    continue
+                if wanted is not None and doc_id not in wanted:
                     continue
                 for doc in docs:
                     if doc in allowed:
-                        keep(doc, 900.0, known)
+                        keep(doc, 900.0, known, doc_id)
         return sorted(hits.values(), key=lambda hit: (-hit.score, hit.product.name))
+
+    def _documents_for(self, query: SearchQuery | None) -> set[str] | None:
+        """Какие приказы уместны этому запросу. `None` — любые.
+
+        Названный документ отсекает жёстко: спросили «по приказу 1057» — из
+        другого приказа не отвечаем вовсе, даже если номер пункта совпал.
+        Аудитория отсекает мягче, но тоже отсекает: садовский подбор не должен
+        обосновываться школьным перечнем, а раньше аудитория работала только в
+        текстовом ранжировании и на поиск по номеру не влияла.
+        """
+        if query is None:
+            return None
+        if query.norm_doc_id:
+            return {query.norm_doc_id}
+        if query.audience:
+            return set(norm_docs.for_audience(query.audience))
+        return None
 
     def _by_text(self, query: SearchQuery, allowed: set[int]) -> list[SearchHit]:
         tokens = [token for token in stems(query.text) if token not in _STOPWORDS]
@@ -267,6 +336,11 @@ class CatalogIndex:
             for doc in list(scores):
                 audiences = self.products[doc].audiences
                 if not audiences:
+                    # Товар не приписан ни к саду, ни к школе: обосновать его
+                    # перечнем нечем. Раньше такие проходили мимо и буста, и
+                    # штрафа — и непривязанная «Тележка для спортинвентаря»
+                    # вставала первой перед позициями с пунктом приказа.
+                    scores[doc] *= _UNKNOWN_AUDIENCE_PENALTY
                     continue
                 scores[doc] *= (
                     _AUDIENCE_BOOST if query.audience in audiences else _AUDIENCE_PENALTY

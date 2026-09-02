@@ -15,15 +15,24 @@ import logging
 import time
 from dataclasses import dataclass, field
 
-from agent.client import ChatClient, LLMAuthError, LLMError
+from agent.client import ChatClient, LLMAuthError, LLMError, LLMPaymentError
 
 log = logging.getLogger(__name__)
 
 # Сколько не трогаем провайдера после сбоя. Без паузы каждое сообщение снова ждало бы
 # полный таймаут, и бот выглядел бы зависшим у всех пользователей сразу.
 COOLDOWN_SECONDS = 300.0
-# Отказ по ключу или деньгам сам не пройдёт — тут нужен человек, а не повтор.
+# Отказ по ключу сам не пройдёт — тут нужен человек, а не повтор. Отказ по
+# деньгам (402) сюда не попадает: счёт пополняют, и провайдер оживает без нас.
+# Пока эти два случая жили под одним сроком, бот после пополнения Cloud.ru
+# ещё полчаса разговаривал запасной моделью — поймано на прогоне 02.09.
 AUTH_COOLDOWN_SECONDS = 1800.0
+
+
+def _pause_for(exc: Exception) -> float:
+    if isinstance(exc, LLMPaymentError):
+        return COOLDOWN_SECONDS
+    return AUTH_COOLDOWN_SECONDS if isinstance(exc, LLMAuthError) else COOLDOWN_SECONDS
 
 
 @dataclass
@@ -46,7 +55,7 @@ class LLMRouter:
         return [c for c in self.clients if self._blocked_until.get(c.name, 0.0) <= now]
 
     def mark_down(self, client: ChatClient, exc: Exception) -> None:
-        pause = AUTH_COOLDOWN_SECONDS if isinstance(exc, LLMAuthError) else COOLDOWN_SECONDS
+        pause = _pause_for(exc)
         self._blocked_until[client.name] = time.monotonic() + pause
         self._last_error[client.name] = str(exc)[:300]
         log.warning(
@@ -116,4 +125,35 @@ def build_router(settings) -> LLMRouter:  # noqa: ANN001 — core.config.Setting
     return LLMRouter(clients=chosen)
 
 
-__all__ = ["LLMRouter", "build_router", "LLMError", "LLMAuthError", "COOLDOWN_SECONDS"]
+def warm_up(router: LLMRouter) -> None:
+    """Короткий вызов каждому провайдеру при запуске.
+
+    Без него первый живой человек платит за проверку связи собственным
+    ожиданием: если Cloud.ru не открывается, его таймаут в шестьдесят секунд
+    достаётся первому же сообщению, и только потом ход уходит запасному.
+    Здесь тот же отказ стоит времени запуска, а не времени пользователя.
+
+    Ответ нам не нужен — важно, поднимется ошибка или нет.
+    """
+    for client in list(router.clients):
+        try:
+            client.complete(
+                [{"role": "user", "content": "пинг"}], temperature=0.0, max_tokens=1
+            )
+        except LLMError as exc:
+            router.mark_down(client, exc)
+            continue
+        router.mark_up(client)
+        log.info("Провайдер %s отвечает (%s).", client.name, client.model)
+
+
+__all__ = [
+    "LLMRouter",
+    "build_router",
+    "warm_up",
+    "LLMError",
+    "LLMAuthError",
+    "LLMPaymentError",
+    "COOLDOWN_SECONDS",
+    "AUTH_COOLDOWN_SECONDS",
+]

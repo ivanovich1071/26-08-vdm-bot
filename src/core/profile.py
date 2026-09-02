@@ -17,6 +17,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from norms import reference
 from norms.extract import document_ids_in_text
 
 MAX_REMEMBERED_SKUS = 20
@@ -29,7 +30,15 @@ MAX_REMEMBERED_SKUS = 20
 # заказчику пишут в первых двух сообщениях.
 
 _INSTITUTIONS: tuple[tuple[str, str], ...] = (
-    ("детский сад", r"детск\w*\s+сад\w*|\bдоу\b|\bдетсад\w*|\bясл\w+|дошкольн\w+"),
+    # «В саду», «садик», «в детсаду» — так говорят чаще, чем «в детском саду»,
+    # и без этих форм учреждение оставалось неизвестным. 02.09 из-за этого
+    # «чем оснастить спортзал в саду» не прошло гейт карточек, и человек получил
+    # три позиции с ценами без единой кнопки «В корзину».
+    (
+        "детский сад",
+        r"детск\w*\s+сад\w*|\bдоу\b|\bдетсад\w*|\bясл\w+|дошкольн\w+|"
+        r"\bсадик\w*|\bсад[уеы]\b|\bсадов\w*\s+групп\w*",
+    ),
     ("школа", r"\bшкол\w+|\bгимнази\w+|\bлице\w+|\bсош\b|\bмбоу\b|начальн\w+\s+класс"),
     ("колледж", r"\bколледж\w*|\bтехникум\w*|\bспо\b"),
     ("центр развития", r"центр\w*\s+развити\w+|развивающ\w+\s+центр"),
@@ -116,7 +125,14 @@ class DialogProfile:
     institution: str | None = None
     room: str | None = None
     age: str | None = None
+    # По каким документам человек оснащает. Отсюда берётся аудитория, поэтому
+    # сюда попадает только то, что сказано о закупке: «подбери по приказу 1057».
     norm_doc_ids: list[str] = field(default_factory=list)
+    # О каких документах он спрашивал. Спросить — не значит закупать: 31.08
+    # вопрос «что значит указ 838» переключил разговор в школьный режим, и через
+    # минуту детсадовский комплект был обоснован школьным приказом. Список
+    # нужен модели для контекста, но на выбор перечня не влияет.
+    asked_about_docs: list[str] = field(default_factory=list)
     budget: str | None = None
     deadline: str | None = None
     region: str | None = None
@@ -229,9 +245,15 @@ class DialogProfile:
             self.age = age
             changed.append("age")
 
+        # Спросить про документ и закупать по нему — разные вещи, и путать их
+        # дорого: 31.08 вопрос «что значит указ 838» перевёл весь дальнейший
+        # разговор в школьный режим, и садовский комплект получил школьное
+        # основание. Вопрос идёт в отдельный список, на аудиторию не влияющий.
+        asking = reference.question_about_document(text) is not None
+        target = self.asked_about_docs if asking else self.norm_doc_ids
         for doc_id in document_ids_in_text(text):
-            if doc_id not in self.norm_doc_ids:
-                self.norm_doc_ids.append(doc_id)
+            if doc_id not in target:
+                target.append(doc_id)
                 changed.append("norm")
 
         budget = _budget(low)
@@ -285,7 +307,12 @@ class DialogProfile:
             if value:
                 lines.append(f"- {label}: {value}")
         if self.norm_doc_ids:
-            lines.append(f"- Норматив: {', '.join(_doc_names(self.norm_doc_ids))}")
+            lines.append(f"- Оснащает по документу: {', '.join(_doc_names(self.norm_doc_ids))}")
+        if self.asked_about_docs:
+            lines.append(
+                "- Спрашивал про документ (это не значит, что закупает по нему): "
+                f"{', '.join(_doc_names(self.asked_about_docs))}"
+            )
         if self.offered:
             lines.append(f"- Уже показано позиций: {len(self.offered)}")
         if self.rejected:
@@ -303,6 +330,7 @@ class DialogProfile:
             "room": self.room,
             "age": self.age,
             "norm_doc_ids": self.norm_doc_ids,
+            "asked_about_docs": self.asked_about_docs,
             "budget": self.budget,
             "deadline": self.deadline,
             "region": self.region,

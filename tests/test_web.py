@@ -38,7 +38,7 @@ def client(tmp_path, monkeypatch):
     storage = Storage(tmp_path / "t.sqlite3")
     settings = Settings(orders_jsonl_path=str(tmp_path / "orders.jsonl"))
     engine = DialogEngine(index, storage, OrderService(storage, JsonlSink(tmp_path / "o.jsonl")), settings)
-    monkeypatch.setattr(web_app, "build_engine", lambda _settings: engine)
+    monkeypatch.setattr(web_app, "build_engine", lambda _settings, **_kw: engine)
     return TestClient(web_app.create_app(settings))
 
 

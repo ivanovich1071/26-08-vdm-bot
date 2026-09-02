@@ -531,7 +531,7 @@ async def main() -> None:
 
     bot = Bot(settings.telegram_token, default=_default_properties(), session=_session())
     bot.session.middleware(RetryOnNetworkError())
-    dispatcher = build_dispatcher(build_engine(settings))
+    dispatcher = build_dispatcher(build_engine(settings, warm_llm=True))
     await _publish_commands(bot)
     log.info("Telegram-бот запущен")
     await _poll_forever(dispatcher, bot)

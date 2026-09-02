@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 
 from agent.agent import SalesAgent
-from agent.providers import build_router
+from agent.providers import build_router, warm_up
 from catalog.repository import load_index
 from core.config import Settings
 from core.dialog import DialogEngine
@@ -24,7 +24,12 @@ from orders.service import OrderService, build_sink
 log = logging.getLogger(__name__)
 
 
-def build_engine(settings: Settings | None = None) -> DialogEngine:
+def build_engine(settings: Settings | None = None, warm_llm: bool = False) -> DialogEngine:
+    """Готовый движок диалога.
+
+    `warm_llm` включают долгоживущие каналы — Telegram и виджет. Разовым
+    командам (`run.py search`) прогрев ни к чему: они и так живут секунду.
+    """
     settings = settings or Settings.from_env()
     index = load_index(settings.kb_path)
     storage = Storage(settings.storage_path)
@@ -36,6 +41,8 @@ def build_engine(settings: Settings | None = None) -> DialogEngine:
     orders = OrderService(storage, build_sink(settings))
 
     router = build_router(settings)
+    if warm_llm and router.configured:
+        warm_up(router)
     agent = None
     if router.configured:
         # Движок агенту нужен, но сам он создаётся ниже — проставим после.

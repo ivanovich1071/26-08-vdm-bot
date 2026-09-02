@@ -186,7 +186,14 @@ def explain(doc_id: str, coverage: dict[str, int] | None = None) -> str:
         tail = f", из них по {coverage['with_code']} известен пункт перечня" if codes else ""
         lines += ["", f"В каталоге к документу привязано позиций: {products}{tail}."]
         if codes:
-            lines[-1] = lines[-1][:-1] + f"; разных пунктов — {codes}."
+            # Всего пунктов в приказе — обязательно рядом с закрытыми. Пока
+            # называлось только «разных пунктов — 892», модель повторяла это как
+            # «в нём 892 пункта», и покрытие выглядело втрое выше настоящего:
+            # в приказе 1057 пунктов две с половиной тысячи.
+            total = coverage.get("total_items") or 0
+            closed = f"; закрыто пунктов перечня — {codes}"
+            closed += f" из {total}." if total else "."
+            lines[-1] = lines[-1][:-1] + closed
 
     if reference.actions:
         lines += ["", "Что могу сделать прямо сейчас:"]
@@ -196,7 +203,7 @@ def explain(doc_id: str, coverage: dict[str, int] | None = None) -> str:
     return "\n".join(lines)
 
 
-def coverage(index, doc_id: str) -> dict[str, int]:  # noqa: ANN001 — catalog.search.CatalogIndex
+def coverage(index, doc_id: str, total_items: int = 0) -> dict[str, int]:  # noqa: ANN001
     """Сколько позиций каталога привязано к документу. Считается по базе знаний.
 
     Цифра в ответе не должна устаревать вместе с текстом справки: выгрузка
@@ -213,7 +220,15 @@ def coverage(index, doc_id: str) -> dict[str, int]:  # noqa: ANN001 — catalog.
         if with_item:
             with_code += 1
             codes.update(with_item)
-    return {"products": products, "with_code": with_code, "codes": len(codes)}
+    return {
+        "products": products,
+        "with_code": with_code,
+        "codes": len(codes),
+        # Всего пунктов в самом приказе — из разобранного текста документа.
+        # Ноль означает «текст приказа не загружен», и тогда справка про полноту
+        # молчит, а не врёт.
+        "total_items": total_items,
+    }
 
 
 def known_documents() -> list[str]:

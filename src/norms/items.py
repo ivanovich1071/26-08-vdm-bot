@@ -198,6 +198,72 @@ def build(sources: dict[str, Path], out: Path = DEFAULT_ITEMS) -> dict[str, int]
     return {doc_id: len(items) for doc_id, items in collected.items()}
 
 
+class ItemIndex:
+    """Справочник пунктов с поиском по словам.
+
+    Появился из-за того, что модель не могла найти пункт по смыслу. Она знала
+    номера из разговора и достраивала остальное сама: «Спортивный комплекс
+    соответствует пункту 2.20.63 приказа 1057», хотя 2.20.63 — это фрезерный
+    станок из приказа 838, а спортивное оборудование в 1057 стоит под 1.5.1.
+    Тексты приказов у нас разобраны давно, не хватало только способа спросить
+    их словами.
+
+    Поиск нарочно простой: совпадение основ слов, длинные пункты чуть ниже
+    коротких. Это не полнотекстовый движок, это замена выдумыванию.
+    """
+
+    def __init__(self, items: dict[str, dict[str, NormItem]]) -> None:
+        self.items = items
+        self._tokens: dict[tuple[str, str], set[str]] = {}
+        for doc_id, by_code in items.items():
+            for code, item in by_code.items():
+                self._tokens[(doc_id, code)] = _stems(f"{item.title} {item.section or ''}")
+
+    @property
+    def loaded(self) -> bool:
+        return bool(self.items)
+
+    def get(self, doc_id: str, code: str) -> NormItem | None:
+        return self.items.get(doc_id, {}).get(code)
+
+    def documents_with(self, code: str) -> list[str]:
+        """В каких приказах есть пункт с таким номером."""
+        return sorted(doc_id for doc_id, by_code in self.items.items() if code in by_code)
+
+    def count(self, doc_id: str) -> int:
+        return len(self.items.get(doc_id, {}))
+
+    def search(self, text: str, doc_id: str | None = None, limit: int = 5) -> list[NormItem]:
+        from catalog.text import expand
+
+        wanted = _stems(text)
+        if not wanted:
+            return []
+        # «Спортзал» в приказе называется «спортивным оборудованием», «мастерская» —
+        # «кабинетом технологии». Раскрываем запрос теми же синонимами, что и в
+        # каталоге, иначе поиск по смыслу молчит ровно там, где он нужен.
+        wanted |= {token for token in expand(sorted(wanted)) if len(token) > 2}
+        scored: list[tuple[float, NormItem]] = []
+        for (item_doc, code), tokens in self._tokens.items():
+            if doc_id and item_doc != doc_id:
+                continue
+            common = wanted & tokens
+            if not common:
+                continue
+            # Доля запроса, которую пункт покрыл, минус наказание за многословие:
+            # иначе абзац на сорок слов обгоняет точную формулировку из трёх.
+            score = len(common) / len(wanted) - 0.01 * len(tokens)
+            scored.append((score, self.items[item_doc][code]))
+        scored.sort(key=lambda pair: (-pair[0], pair[1].code))
+        return [item for _, item in scored[:limit]]
+
+
+def _stems(text: str) -> set[str]:
+    from catalog.text import stems
+
+    return {token for token in stems(text) if len(token) > 2}
+
+
 def load(path: Path = DEFAULT_ITEMS) -> dict[str, dict[str, NormItem]]:
     """Справочник в память: документ → номер пункта → пункт.
 

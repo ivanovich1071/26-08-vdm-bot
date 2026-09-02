@@ -131,8 +131,14 @@ def _tool_round(client: ChatClient) -> Step:
     return Step("Вызов инструмента", bool(text), text[:120] or "пустой ответ", _since(started))
 
 
-def report(clients: list[ChatClient]) -> str:
-    """Человекочитаемый отчёт по всем настроенным провайдерам."""
+def report(clients: list[ChatClient], router=None) -> str:  # noqa: ANN001 — providers.LLMRouter
+    """Человекочитаемый отчёт по всем настроенным провайдерам.
+
+    `router` показывает, кто из них сейчас в паузе после сбоя. Паузу держит тот
+    процесс, который на неё нарвался, поэтому пауза работающего бота здесь не
+    видна — об этом сказано в самом отчёте, чтобы «у меня проверка зелёная, а
+    бот отвечает другой моделью» не выглядело загадкой.
+    """
     if not clients:
         return (
             "Ни один провайдер не настроен.\n"
@@ -140,10 +146,19 @@ def report(clients: list[ChatClient]) -> str:
             "работает, но отвечает поиском по каталогу, без диалога."
         )
 
+    blocked = {
+        row["name"]: float(row["blocked_for"])
+        for row in (router.status() if router is not None else [])
+        if float(row["blocked_for"]) > 0
+    }
+
     lines: list[str] = []
     working: list[str] = []
     for client in clients:
         lines.append(f"\n{client.name} · {client.model} · {client.base_url}")
+        pause = blocked.get(client.name)
+        if pause:
+            lines.append(f"  · в паузе после сбоя ещё {pause:.0f} с")
         steps = check(client)
         lines += [str(step) for step in steps]
         if steps and all(step.ok for step in steps):
@@ -152,6 +167,11 @@ def report(clients: list[ChatClient]) -> str:
     lines.append("")
     if working:
         lines.append(f"Готов к работе: {', '.join(working)}. Диалоговый режим включится сам.")
+        lines.append(
+            "Проверка идёт отдельным процессом: паузу после сбоя каждый держит свою, "
+            "и запущенный бот мог остаться на запасном провайдере — тогда его надо "
+            "перезапустить."
+        )
     else:
         lines.append(
             "Ни один провайдер не отвечает — бот будет работать поиском по каталогу.\n"

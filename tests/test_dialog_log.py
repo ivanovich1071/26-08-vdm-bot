@@ -133,3 +133,25 @@ def test_read_dialogs_groups_by_session(engine, tmp_path):
     engine.handle_text("u2", CHANNEL, "станок")
     sessions = read_dialogs(tmp_path / "dialogs")
     assert len(sessions) == 2
+
+
+def test_an_action_does_not_inherit_the_previous_turn_spending(engine, tmp_path):
+    """02.09: расход одного ответа модели попал в журнал трижды.
+
+    `handle_text` расход обнуляет, а `handle_action` — нет, и нажатие «Корзина»
+    записывалось с токенами и рублями предыдущего хода.
+    """
+    session = engine.session(USER, CHANNEL)
+    session.usage = {"provider": "cloudru", "calls": 2, "tokens_in": 12087}
+    session.route = {"role": "sell"}
+
+    engine.handle_action(USER, CHANNEL, "cart")
+
+    records = [
+        json.loads(line)
+        for path in (tmp_path / "dialogs").glob("*.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert records[-1]["kind"] == "action"
+    assert "usage" not in records[-1]
+    assert "route" not in records[-1]

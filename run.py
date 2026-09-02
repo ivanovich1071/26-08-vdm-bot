@@ -17,7 +17,23 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 
+def _utf8_output() -> None:
+    """Вывод в UTF-8 при любом перенаправлении.
+
+    Консоль Windows берёт cp1251, и в неё не влезают ни «✓», ни «₽». Пока
+    вывод идёт в окно, Python это скрывает, но стоит написать
+    `run.py llm | Tee-Object -FilePath ...` — и команда падает с
+    UnicodeEncodeError вместо отчёта. Ровно это лежит в
+    data/llm_check_20260902_095514.log.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 def main() -> None:
+    _utf8_output()
     parser = argparse.ArgumentParser(description="Бот-магазин ЭЛТИ-КУДИЦ")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -118,8 +134,9 @@ def main() -> None:
         from core.config import Settings
 
         settings = Settings.from_env()
+        router = build_router(settings)
         print(f"LLM_PROVIDER={settings.llm_provider}")
-        print(report(build_router(settings).clients))
+        print(report(router.clients, router))
 
     elif args.command == "media":
         _collect_media(args)

@@ -73,7 +73,12 @@ _RE_FUNC_KITS = re.compile(r"перечн\w*\s+функциональных\s+к
 _RE_SLUG_CODE = re.compile(r"/(\d+(?:_\d+){1,3})_[a-z0-9_]+")
 
 # Номер пункта в свободном тексте: «п. 2.1.14», «пункт 2.11.3».
-_RE_TEXT_CODE = re.compile(r"\b(?:п\.?|пункт)\s*(\d+(?:\.\d+){1,3})\b", re.IGNORECASE)
+#
+# Глубина — до шести чисел. Пункты 1057 уходят так далеко («1.13.4.3.1.6»), и в
+# реестре заказчика их большинство. Пока предел стоял на четырёх, номер резался
+# пополам: «покажи 1.13.4.3.1.6» превращалось в «1.13.4.3» и фантомный «1.6», и
+# человек получал соседний пункт вместо того, который назвал.
+_RE_TEXT_CODE = re.compile(r"\b(?:п\.?|пункт)\s*(\d+(?:\.\d+){1,5})\b", re.IGNORECASE)
 
 
 def document_ids_in_text(text: str) -> list[str]:
@@ -122,7 +127,7 @@ def codes_in_query(text: str) -> list[str]:
     if not text:
         return []
     found = [normalize_code(c) for c in _RE_TEXT_CODE.findall(text)]
-    for token in re.findall(r"\b\d+(?:\.\d+){1,3}\b", text):
+    for token in re.findall(r"\b\d+(?:\.\d+){1,5}\b", text):
         code = normalize_code(token)
         if code not in found:
             found.append(code)

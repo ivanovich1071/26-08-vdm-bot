@@ -49,7 +49,10 @@ GREETING = (
     "Напишите своими словами, что нужно. Например:\n"
     "• «чем оснастить спортзал в саду, дети 3–6 лет»;\n"
     "• «что значит приказ 838» — объясню документ;\n"
-    "• «2.1.14» — покажу позиции по пункту перечня.\n\n"
+    # Пример намеренно из приказа 1057: пункт 2.1.14, стоявший здесь раньше,
+    # есть только в школьном приказе 838 — бот сам приглашал детский сад
+    # ввести чужой номер, а потом объяснял, почему по нему ничего нет.
+    "• «1.5.1» — покажу позиции по пункту перечня.\n\n"
     "Можно просто описать задачу — разберёмся вместе.\n"
     "Можете воспользоваться кнопками, но это не обязательно."
 )
@@ -59,7 +62,7 @@ GREETING = (
 HELP = (
     "Что я умею:\n\n"
     "• подобрать оборудование по описанию задачи — «кабинет логопеда в детском саду»;\n"
-    "• найти позиции по пункту перечня — «2.1.14» или «1.13.3»;\n"
+    "• найти позиции по пункту перечня — «1.5.1» или «1.13.3»;\n"
     "• объяснить документ — «что значит приказ 838»;\n"
     "• собрать корзину и передать заявку менеджеру.\n\n"
     "Команды:\n"
@@ -109,6 +112,20 @@ KEYBOARD_ACTIONS: dict[str, str] = {
 }
 
 
+def _not_listed(audience: str | None) -> str | None:
+    """Честная строка вместо пустого основания.
+
+    Почти половина каталога к перечням не привязана — реестра «пункт 838 → код
+    1С» у заказчика нет вовсе. Молчать об этом хуже, чем сказать: закупщик по
+    пустому месту решит, что основание есть и просто не показано.
+    """
+    if audience == "preschool":
+        return "в перечнях для дошкольных организаций эта позиция не числится — уточнит менеджер"
+    if audience == "school":
+        return "в перечнях для школ эта позиция не числится — уточнит менеджер"
+    return "в перечнях приказов эта позиция не числится — уточнит менеджер"
+
+
 @dataclass
 class Session:
     """Состояние диалога одного пользователя.
@@ -148,6 +165,10 @@ class Session:
     # модель ссылается на позицию, показанную ходом раньше. Именно так теряется
     # ответ на возражение «дорого»: там инструменты не вызываются вовсе.
     prices: set[int] = field(default_factory=set)
+    # То же для нормативных оснований: пары «приказ, пункт», которые инструменты
+    # подтвердили за разговор. Модель ссылается на пункт из прошлого хода так же
+    # свободно, как на цену, и проверка по одному ходу отвергала бы честный ответ.
+    norm_refs: set[tuple[str, str]] = field(default_factory=set)
 
     def remember(self, role: str, content: str) -> None:
         self.history.append({"role": role, "content": self.masker.mask(content)})
@@ -158,6 +179,7 @@ class Session:
         self.profile = DialogProfile()
         self.masker = Masker()
         self.prices.clear()
+        self.norm_refs.clear()
 
 
 class DialogEngine:
@@ -180,9 +202,9 @@ class DialogEngine:
         self.media = media
         self._sessions: dict[str, Session] = {}
         self._roots: list[str] | None = None
-        # Пункты приказов с формулировками. Файла может не быть — тогда бот
-        # называет номер пункта без текста, как и раньше.
-        self._norm_texts = norm_items.load()
+        # Пункты приказов с формулировками и поиском по словам. Файла может не
+        # быть — тогда бот называет номер пункта без текста, как и раньше.
+        self.norm_texts = norm_items.ItemIndex(norm_items.load())
 
     def session(self, user_id: str, channel: str) -> Session:
         key = f"{channel}:{user_id}"
@@ -237,6 +259,12 @@ class DialogEngine:
 
     def handle_action(self, user_id: str, channel: str, action: str) -> list[Response]:
         started = time.monotonic()
+        # Расход и роль сбрасываются так же, как в текстовом ходе. Без этого на
+        # нажатие «Корзина» в журнал уходили токены и рубли предыдущего ответа
+        # модели — 02.09 один и тот же ход оказался посчитан трижды.
+        session = self.session(user_id, channel)
+        session.usage = {}
+        session.route = {}
         responses = self._handle_action(user_id, channel, action)
         self._log(user_id, channel, "action", action, responses, started)
         return responses
@@ -407,7 +435,7 @@ class DialogEngine:
             return [
                 Message(
                     "Ничего не нашёл по этому запросу. Попробуйте назвать товар иначе "
-                    "или указать пункт приказа — например, «2.1.14».\n"
+                    "или указать пункт приказа — например, «1.5.1».\n"
                     f"Если нужно, подключим менеджера: {self.settings.manager_contact}.",
                     keyboard=self._main_menu(),
                 )
@@ -430,6 +458,16 @@ class DialogEngine:
         """
         kind = intent.classify(text)
 
+        # Вопрос о документе отвечается из наших данных и без модели тоже.
+        # 01.09 на «по какому приказу оснащается детский сад» бот выдал полсотни
+        # случайных товаров: вопрос попал в товарную ветку, и справка, которая
+        # лежала рядом, не пригодилась.
+        if kind is intent.NORM_QUESTION:
+            doc_id = norm_reference.question_about_document(text)
+            if doc_id is None:
+                return self._norm_help()
+            return self._explain_norm(session, doc_id)
+
         if kind in (intent.GREETING, intent.SMALL_TALK):
             return [
                 Message(
@@ -444,7 +482,7 @@ class DialogEngine:
                 Message(
                     "Сейчас я отвечаю проще обычного — консультант временно "
                     "недоступен. Могу показать каталог или найти позиции по "
-                    "пункту перечня, например «2.1.14».\n"
+                    "пункту перечня, например «1.5.1».\n"
                     f"По остальным вопросам — менеджер: {self.settings.manager_contact}.",
                     keyboard=self._offer_menu(),
                 )
@@ -458,7 +496,7 @@ class DialogEngine:
             return [
                 Message(
                     "Ничего не нашёл по этому запросу. Попробуйте назвать товар иначе "
-                    "или указать пункт приказа — например, «2.1.14».\n"
+                    "или указать пункт приказа — например, «1.5.1».\n"
                     f"Если нужно, подключим менеджера: {self.settings.manager_contact}.",
                     keyboard=self._offer_menu(),
                 )
@@ -491,7 +529,10 @@ class DialogEngine:
         cards = [
             ProductCard(
                 product=hit.product,
-                citation=hit.citation(),
+                # Пустая строка основания читается как «мы не проверяли». В
+                # подробной карточке об этом сказано давно, а в выдаче позиция
+                # без привязки молчала — и стояла вперемешку с обоснованными.
+                citation=hit.citation() or _not_listed(hit.audience),
                 keyboard=Keyboard().row(
                     Button("В корзину", f"add:{hit.product.sku_1c}"),
                     Button("Подробнее", f"card:{hit.product.sku_1c}"),
@@ -559,7 +600,7 @@ class DialogEngine:
         """
         lines: list[str] = []
         for ref in product.norms_for(audience):
-            item = self._norm_texts.get(ref.doc_id, {}).get(ref.item_code or "")
+            item = self.norm_texts.get(ref.doc_id, ref.item_code or "")
             title = item.title if item else ref.item_title
             line = ref.citation
             if title:
@@ -571,11 +612,10 @@ class DialogEngine:
         # Молчание об основании читается как «мы не проверяли». Почти половина
         # каталога к перечням не привязана, и человеку, который собирает закупку,
         # честный ответ нужнее пустого места.
-        if not lines and audience:
-            where = "дошкольных организаций" if audience == "preschool" else "школ"
-            lines.append(
-                f"в перечнях для {where} эта позиция не числится — уточнит менеджер"
-            )
+        if not lines:
+            note = _not_listed(audience)
+            if note:
+                lines.append(note)
         return lines
 
     def photo_path(self, product: Product) -> str | None:
@@ -688,7 +728,7 @@ class DialogEngine:
             Message(
                 "По какому документу подбираем? Нажмите — объясню, что это за документ "
                 "и что по нему есть в каталоге.\n\n"
-                "Можно и сразу номером пункта: «2.20.63», «п. 2.1.14» или подраздел «2.4».",
+                "Можно и сразу номером пункта: «2.20.63», «п. 1.5.1» или подраздел «2.4».",
                 keyboard=keyboard,
             )
         ]
@@ -700,11 +740,17 @@ class DialogEngine:
         недоступен: именно на нём отказ модели заметнее всего, а ответ полностью
         собирается из наших данных.
         """
-        text = norm_reference.explain(doc_id, norm_reference.coverage(self.index, doc_id))
+        text = norm_reference.explain(
+            doc_id,
+            norm_reference.coverage(self.index, doc_id, self.norm_texts.count(doc_id)),
+        )
         if not text:
             return [Message("По этому документу справки пока нет.", keyboard=self._main_menu())]
-        if doc_id not in session.profile.norm_doc_ids:
-            session.profile.norm_doc_ids.append(doc_id)
+        # Справка не назначает документ, по которому идёт закупка: человек
+        # спросил, что это такое, а не сказал «оснащаю по нему». Иначе один
+        # вопрос про 838 переводил в школьный режим весь остаток разговора.
+        if doc_id not in session.profile.asked_about_docs:
+            session.profile.asked_about_docs.append(doc_id)
         session.remember("assistant", text)
 
         keyboard = Keyboard().row(Button("Показать позиции", f"norm_items:{doc_id}"))

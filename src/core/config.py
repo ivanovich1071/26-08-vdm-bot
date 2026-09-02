@@ -40,9 +40,9 @@ class Settings:
     cloudru_model: str = "deepseek-ai/DeepSeek-V4-Flash"
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    openrouter_model: str = "qwen/qwen3-235b-a22b-2507"
+    openrouter_model: str = "deepseek/deepseek-chat-v3-0324"
     llm_timeout_seconds: float = 60.0
-    llm_max_tokens: int = 1200
+    llm_max_tokens: int = 2000
     # Рубли за миллион токенов — по прайсу провайдера на 01.09.2026. Нужны,
     # чтобы в журнале стояла стоимость хода: выбирать модель по цифрам дешевле,
     # чем по впечатлению. Цены меняются, поэтому это настройка, а не константа.

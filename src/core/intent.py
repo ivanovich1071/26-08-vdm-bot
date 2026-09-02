@@ -66,7 +66,17 @@ _GOODS_WORDS = re.compile(
 # грубый признак, чтобы не тащить в этот модуль нормативный слой.
 _NORM_QUESTION = re.compile(
     r"(?:что\s+(?:такое|значит|за)|расскаж\w+|объясн\w+|зачем|почему|"
-    r"на\s+основании|обязан\w+)\D{0,40}(?:приказ|перечен\w+|фгос|фоп|норматив)",
+    r"на\s+основании|обязан\w+|по\s+как\w+|как\w+\s+приказ\w*|каким\s+)"
+    r"\D{0,40}(?:приказ|перечен\w+|фгос|фоп|норматив)",
+    re.IGNORECASE,
+)
+# «По какому приказу оснащается детский сад» — вопрос о документе, хотя ни
+# «что такое», ни «объясни» в нём нет. 01.09 такой вопрос ушёл в товарную ветку,
+# и человек получил полсотни случайных позиций вместо ответа.
+_WHICH_DOCUMENT = re.compile(
+    r"по\s+как\w+\s+(?:приказ\w*|перечн\w+|документ\w*)|"
+    r"как\w+\s+(?:приказ\w*|перечн\w+|документ\w*)\D{0,20}(?:оснащ\w+|комплект\w+|закупа\w+)|"
+    r"на\s+основании\s+чего",
     re.IGNORECASE,
 )
 
@@ -87,8 +97,29 @@ def asks_for_goods(text: str) -> bool:
     return bool(_ASK_FOR_GOODS.search(text or ""))
 
 
+# Вопрос о смысле пункта, а не просьба показать по нему товары: «что такое
+# пункт 2.1.14», «что входит в 1.13.3». Разница видна только по обороту.
+_ABOUT_CODE = re.compile(
+    r"(?:что\s+(?:такое|значит|за|входит)|расскаж\w+|объясн\w+|как\s+звучит|"
+    r"формулировк\w+|существу\w+\s+ли|есть\s+ли\s+так\w+\s+пункт)",
+    re.IGNORECASE,
+)
+
+
 def classify(text: str) -> str:
-    """Одно из: greeting, small_talk, norm_code, norm_question, product, other."""
+    """Одно из: greeting, small_talk, norm_code, norm_question, product, other.
+
+    Порядок проверок выстрадан журналом.
+
+    «Что значит приказ 1057 и подбери товары по нему» уходило консультанту, у
+    которого нет поисковых инструментов, — и подбор состоял из отсылок к прошлой
+    выдаче. Поэтому нормативный вопрос считается вопросом, только если в реплике
+    нет просьбы показать товар.
+
+    Обратный случай — «что такое пункт 2.1.14» — считался товарным запросом
+    просто потому, что номер проверялся первым, и человек вместо объяснения
+    получал карточки.
+    """
     text = (text or "").strip()
     if not text:
         return OTHER
@@ -96,11 +127,12 @@ def classify(text: str) -> str:
         return GREETING
     if _SMALL_TALK.match(text):
         return SMALL_TALK
+    wants_goods = bool(_ASK_FOR_GOODS.search(text))
     if norm_code(text):
-        return NORM_CODE
-    if _NORM_QUESTION.search(text):
+        return NORM_QUESTION if _ABOUT_CODE.search(text) and not wants_goods else NORM_CODE
+    if (_NORM_QUESTION.search(text) or _WHICH_DOCUMENT.search(text)) and not wants_goods:
         return NORM_QUESTION
-    if _ASK_FOR_GOODS.search(text) or _GOODS_WORDS.search(text):
+    if wants_goods or _GOODS_WORDS.search(text):
         return PRODUCT
     return OTHER
 
